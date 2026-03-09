@@ -825,6 +825,7 @@ if (need_network_data) {
           Is_Highlight ~ shorten_id(id),
           Is_Focus_Gene & !is.na(Symbol) & Symbol != "" ~ Symbol,
           Is_Focus_Gene ~ shorten_id(id),
+          Is_TF & !is.na(Symbol) & Symbol != "" & !is.na(Family) ~ paste0(Symbol, "\n(", Family, ")"),
           Is_TF & !is.na(Symbol) & Symbol != "" ~ Symbol,
           Is_TF & !is.na(Family) ~ paste0(shorten_id(id), "\n(", Family, ")"),
           Is_TF ~ shorten_id(id),
