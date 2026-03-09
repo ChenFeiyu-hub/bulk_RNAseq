@@ -816,13 +816,23 @@ if (need_network_data) {
           TRUE         ~ "Target"
         ),
         Label = case_when(
+          # Focus TF (最高优先级)
           Is_Focus_TF & !is.na(Symbol) & Symbol != "" ~
             paste0(Symbol, " (", Family, ")"),
           Is_Focus_TF & !is.na(Family) ~
             paste0(shorten_id(id), " (", Family, ")"),
           Is_Focus_TF ~ shorten_id(id),
+  
+          # 修复: Highlight + TF → 也带 Family
+          Is_Highlight & Is_TF & !is.na(Symbol) & Symbol != "" & !is.na(Family) ~
+            paste0(Symbol, "\n(", Family, ")"),
+          Is_Highlight & Is_TF & !is.na(Family) ~
+            paste0(shorten_id(id), "\n(", Family, ")"),
+  
+          # Highlight (非 TF)
           Is_Highlight & !is.na(Symbol) & Symbol != "" ~ Symbol,
           Is_Highlight ~ shorten_id(id),
+
           Is_Focus_Gene & !is.na(Symbol) & Symbol != "" ~ Symbol,
           Is_Focus_Gene ~ shorten_id(id),
           Is_TF & !is.na(Symbol) & Symbol != "" & !is.na(Family) ~ paste0(Symbol, "\n(", Family, ")"),
