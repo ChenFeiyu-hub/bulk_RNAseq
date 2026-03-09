@@ -2,7 +2,34 @@
 ################################################################################
 # RNAseq Pipeline 7c: GRN Network Visualization
 #
-# 版本: v4.2 (Ego-Network 拓扑约束)
+# 版本: v4.4 (参数化 Degree 控制 + 截断后重剪枝)
+#
+# ============================================================================
+# v4.4 更新日志 (基于 v4.3)
+# ============================================================================
+# 1. Degree-1 target 保留改为双参数控制:
+#    - --network_keep_deg1_all   (默认 FALSE): 保留所有 TF 的 degree=1 target
+#    - --network_keep_deg1_focus (默认 FALSE): 单独豁免 focus gene 的 degree=1 target
+#    - 默认: 两者均 FALSE → 不显示任何 degree=1 target
+#    - highlight 基因不再自动免检 degree 约束
+#
+# 2. Degree 剪枝逻辑提取为可复用函数 prune_degree1_targets():
+#    - Step 1d:  初始剪枝 (anchor 边选取后)
+#    - Step 1e2: Safety cap 截断后重新执行 (截断可能产生新的 degree=1 节点)
+#
+# 3. 处理链路: 1c→1d(degree)→1d2(ego)→1e(cap)→1e2(degree重)→1e3(连通性)
+#
+# ============================================================================
+# v4.3 更新日志 (基于 v4.2)
+# ============================================================================
+# 1. 参数重命名: --network_max_nodes → --network_max_edges (默认 600)
+#    - 直接控制边数上限, 去掉原先 ×3 的经验换算
+#    - bash 层面对应: GRN_NETWORK_MAX_EDGES
+#
+# 2. Safety Cap 后拓扑连通性重校验 (Step 1e2):
+#    - 截断边后重新从 focus_gene 计算可达性
+#    - 移除与 focus_gene 断联的孤岛节点及其关联边
+#    - 确保 Fig4 网络中所有节点与 focus_gene 保持拓扑连接
 #
 # ============================================================================
 # v4.2 更新日志 (基于 v4.1)
@@ -62,7 +89,7 @@ parse_arguments <- function() {
     condition_wt          = "WT",
     condition_mut         = "dof",
     # Fig4 网络图参数
-    network_max_nodes     = 200,
+    network_max_edges     = 600,
     network_layout        = "kk",
     network_seed          = 42,
     network_prune         = TRUE,
@@ -75,6 +102,9 @@ parse_arguments <- function() {
     network_node_size_max = 12,
     # ★ v4.2: Ego-Network 拓扑步数
     network_ego_steps     = 0,
+    # ★ v4.4: Degree-1 target 保留控制
+    network_keep_deg1_all   = FALSE,   # 保留所有TF的 degree=1 target
+    network_keep_deg1_focus = FALSE,   # 单独豁免 focus gene 的 degree=1 target
     # Fig5 Circos
     circos_max_edges      = 500,
     circos_top_edges      = 300,
@@ -191,12 +221,80 @@ parse_color_string <- function(s) {
 # --- 缩短 Gene ID ---
 shorten_id <- function(x) sub("_.*$", "", x)
 
+# --- ★ v4.4: Degree-based target pruning (可复用) ---
+# 该函数在初始剪枝和 safety cap 后均被调用.
+# Essential 节点 = 所有 TF + focus_gene, highlight 基因不再自动免检.
+# effective_degree 仅基于 differential edges (排除 Conserved).
+prune_degree1_targets <- function(net_edges, tf_family_map,
+                                    focus_gene_id, focus_tf_ids,
+                                    keep_deg1_all, keep_deg1_focus,
+                                    label = "") {
+
+  all_nodes <- unique(c(net_edges$TF_Gene, net_edges$Target_Gene))
+  all_tf_ids <- intersect(all_nodes, names(tf_family_map))
+
+  # Essential: TFs + focus_gene (highlight 不再免检)
+  essential <- unique(c(all_tf_ids, focus_tf_ids))
+  if (!is.null(focus_gene_id) && !is.na(focus_gene_id) && focus_gene_id != "none") {
+    essential <- unique(c(essential, focus_gene_id))
+  }
+
+  # Effective degree: 仅 differential edges
+  diff_df <- net_edges %>% filter(edge_class != "Conserved")
+  if (nrow(diff_df) > 0) {
+    g_diff <- igraph::graph_from_data_frame(
+      diff_df %>% select(TF_Gene, Target_Gene), directed = TRUE
+    )
+    eff_deg <- igraph::degree(g_diff, mode = "all")
+  } else {
+    eff_deg <- integer(0)
+  }
+
+  # Focus gene 的直接邻居 (全边集, 含 Conserved)
+  focus_nbrs <- character(0)
+  if (!is.null(focus_gene_id) && !is.na(focus_gene_id) && focus_gene_id != "none") {
+    focus_nbrs <- unique(c(
+      net_edges$Target_Gene[net_edges$TF_Gene == focus_gene_id],
+      net_edges$TF_Gene[net_edges$Target_Gene == focus_gene_id]
+    ))
+  }
+
+  keep <- character(0)
+  for (nid in all_nodes) {
+    if (nid %in% essential) {
+      keep <- c(keep, nid)
+    } else {
+      d <- eff_deg[nid]
+      if (!is.na(d) && d > 1) {
+        keep <- c(keep, nid)
+      } else if (keep_deg1_all) {
+        keep <- c(keep, nid)
+      } else if (keep_deg1_focus && nid %in% focus_nbrs) {
+        keep <- c(keep, nid)
+      }
+      # else: degree ≤ 1 且无豁免 → 剪除
+    }
+  }
+  keep <- unique(keep)
+
+  n_before <- length(all_nodes)
+  n_pruned <- n_before - length(keep)
+
+  out_edges <- net_edges %>%
+    filter(TF_Gene %in% keep & Target_Gene %in% keep)
+
+  cat(sprintf("       [%s] Degree prune: %d → %d nodes (-%d) | %d edges\n",
+              label, n_before, length(keep), n_pruned, nrow(out_edges)))
+
+  out_edges
+}
+
 ################################################################################
 # 主程序
 ################################################################################
 
 cat("================================================================================\n")
-cat("  Pipeline 7c: GRN Network Visualization (v4.2)\n")
+cat("  Pipeline 7c: GRN Network Visualization (v4.4)\n")
 cat("================================================================================\n\n")
 cat(sprintf("开始时间: %s\n\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))
 
@@ -269,8 +367,11 @@ sink(log_con, type = "message")
 cat(sprintf("  Plots to generate: %s\n", paste(PARAMS$plots_vec, collapse = ", ")))
 cat(sprintf("  Focus family: %s | Focus gene: %s\n",
             PARAMS$focus_tf_family, PARAMS$focus_gene))
-cat(sprintf("  v4.2 params: ego_steps=%d, show_heatmap_stars=%s, circos_top_edges=%d\n",
-            PARAMS$network_ego_steps, PARAMS$show_heatmap_stars, PARAMS$circos_top_edges))
+cat(sprintf("  v4.4 params: ego_steps=%d, max_edges=%d, keep_deg1_all=%s, keep_deg1_focus=%s\n",
+            PARAMS$network_ego_steps, PARAMS$network_max_edges,
+            PARAMS$network_keep_deg1_all, PARAMS$network_keep_deg1_focus))
+cat(sprintf("               show_heatmap_stars=%s, circos_top_edges=%d\n",
+            PARAMS$show_heatmap_stars, PARAMS$circos_top_edges))
 cat(sprintf("  v4.0 new: deseq2_rdata=%s\n",
             ifelse(is.null(PARAMS$deseq2_rdata), "NULL", basename(PARAMS$deseq2_rdata))))
 
@@ -361,7 +462,7 @@ cat(sprintf("  Time colors: %s\n", paste(names(colors$time), colors$time, sep="=
 plot_results <- list()
 
 # ========================================================================
-# Part 1: 共享网络数据构建 (v4.2: 含 Ego-Network 拓扑约束)
+# Part 1: 共享网络数据构建 (v4.4: 参数化 Degree + 截断重剪枝)
 # ========================================================================
 
 need_network_data <- any(c("network", "evidence_heatmap") %in% PARAMS$plots_vec)
@@ -369,7 +470,7 @@ need_network_data <- any(c("network", "evidence_heatmap") %in% PARAMS$plots_vec)
 network_data <- NULL
 
 if (need_network_data) {
-  cat("\n--- Part 1: 构建共享网络数据 (v4.2: Ego-Network 拓扑约束) ---\n")
+  cat("\n--- Part 1: 构建共享网络数据 (v4.4: 参数化 Degree + 截断重剪枝) ---\n")
 
   network_data <- tryCatch({
 
@@ -430,56 +531,21 @@ if (need_network_data) {
                 raw_class_counts["Rewired"] %||% 0,
                 raw_class_counts["Conserved"] %||% 0))
 
-    # --- Step 1d: 智能剪枝 (Conserved 不计入度数) ---
+    # --- Step 1d: 智能剪枝 (v4.4: 参数化 degree 控制) ---
     if (PARAMS$network_prune) {
-      cat("    Smart pruning (v3.0: Conserved excluded from degree)...\n")
+      cat("    Smart pruning (v4.4: parameterized degree control)...\n")
+      cat(sprintf("       keep_deg1_all=%s | keep_deg1_focus=%s\n",
+                  PARAMS$network_keep_deg1_all, PARAMS$network_keep_deg1_focus))
 
-      diff_edges <- net_edges %>% filter(edge_class != "Conserved")
-      cons_edges <- net_edges %>% filter(edge_class == "Conserved")
-
-      cat(sprintf("       Differential edges: %d | Conserved edges: %d\n",
-                  nrow(diff_edges), nrow(cons_edges)))
-
-      if (nrow(diff_edges) > 0) {
-        temp_g_diff <- igraph::graph_from_data_frame(
-          diff_edges %>% select(TF_Gene, Target_Gene), directed = TRUE
-        )
-        effective_degrees <- igraph::degree(temp_g_diff, mode = "all")
-      } else {
-        effective_degrees <- integer(0)
-      }
-
-      temp_g_all <- igraph::graph_from_data_frame(
-        net_edges %>% select(TF_Gene, Target_Gene), directed = TRUE
+      net_edges <- prune_degree1_targets(
+        net_edges       = net_edges,
+        tf_family_map   = tf_family_map,
+        focus_gene_id   = PARAMS$focus_gene,
+        focus_tf_ids    = anchor_focus_tfs,
+        keep_deg1_all   = PARAMS$network_keep_deg1_all,
+        keep_deg1_focus = PARAMS$network_keep_deg1_focus,
+        label           = "Step1d"
       )
-      all_node_ids_temp <- igraph::V(temp_g_all)$name
-
-      all_tf_ids_in_net <- intersect(all_node_ids_temp, names(tf_family_map))
-
-      essential_nodes <- unique(c(anchor_genes, all_tf_ids_in_net))
-
-      nodes_to_keep <- character(0)
-      for (nid in all_node_ids_temp) {
-        if (nid %in% essential_nodes) {
-          nodes_to_keep <- c(nodes_to_keep, nid)
-        } else {
-          eff_deg <- effective_degrees[nid]
-          if (!is.na(eff_deg) && eff_deg > 1) {
-            nodes_to_keep <- c(nodes_to_keep, nid)
-          }
-        }
-      }
-      nodes_to_keep <- unique(nodes_to_keep)
-
-      n_before <- length(all_node_ids_temp)
-      n_pruned <- n_before - length(nodes_to_keep)
-
-      net_edges <- net_edges %>%
-        filter(TF_Gene %in% nodes_to_keep & Target_Gene %in% nodes_to_keep)
-
-      cat(sprintf("       Nodes: %d → %d (pruned %d non-essential degree≤1 nodes)\n",
-                  n_before, length(nodes_to_keep), n_pruned))
-      cat(sprintf("       Edges after pruning: %d\n", nrow(net_edges)))
 
       if (nrow(net_edges) == 0) {
         stop("All edges removed after pruning.")
@@ -591,7 +657,7 @@ if (need_network_data) {
     }
 
     # --- Step 1e: 安全截断 ---
-    max_edges <- PARAMS$network_max_nodes * 3
+    max_edges <- PARAMS$network_max_edges
 
     if (nrow(net_edges) > max_edges) {
       cat(sprintf("    Safety cap: %d edges > limit %d\n", nrow(net_edges), max_edges))
@@ -614,6 +680,75 @@ if (need_network_data) {
       }
 
       cat(sprintf("       Truncated to %d edges\n", nrow(net_edges)))
+    }
+
+    # =================================================================
+    # ★ Step 1e2: 截断后 Degree 重剪枝 (v4.4 新增)
+    # =================================================================
+    # Safety cap 截断可能使原来 degree>1 的节点降为 degree=1,
+    # 产生新的单线伞状结构. 此步骤用相同参数重新执行 degree 剪枝.
+    # =================================================================
+
+    if (PARAMS$network_prune) {
+      n_edges_before_reprune <- nrow(net_edges)
+
+      net_edges <- prune_degree1_targets(
+        net_edges       = net_edges,
+        tf_family_map   = tf_family_map,
+        focus_gene_id   = PARAMS$focus_gene,
+        focus_tf_ids    = anchor_focus_tfs,
+        keep_deg1_all   = PARAMS$network_keep_deg1_all,
+        keep_deg1_focus = PARAMS$network_keep_deg1_focus,
+        label           = "Step1e2-postCap"
+      )
+
+      if (nrow(net_edges) < n_edges_before_reprune) {
+        cat(sprintf("       Post-cap degree reprune: %d → %d edges\n",
+                    n_edges_before_reprune, nrow(net_edges)))
+      }
+    }
+
+    # =================================================================
+    # ★ Step 1e3: 截断后拓扑连通性重校验 (v4.3)
+    # =================================================================
+    # Safety cap + degree 重剪枝可能切断 focus_gene 的间接路径,
+    # 导致出现与 focus_gene 无拓扑连接的孤岛子图.
+    # =================================================================
+
+    if (!is.null(focus_gene_for_ego) &&
+        focus_gene_for_ego != "none" &&
+        !is.na(focus_gene_for_ego)) {
+
+      post_cap_nodes <- unique(c(net_edges$TF_Gene, net_edges$Target_Gene))
+
+      if (focus_gene_for_ego %in% post_cap_nodes) {
+        g_post_cap <- igraph::graph_from_data_frame(
+          net_edges %>% select(TF_Gene, Target_Gene), directed = TRUE
+        )
+        g_post_cap_undir <- igraph::as.undirected(g_post_cap, mode = "collapse")
+
+        dists_post <- igraph::distances(
+          g_post_cap_undir, v = focus_gene_for_ego, mode = "all"
+        )[1, ]
+
+        reachable_post <- names(dists_post)[
+          !is.na(dists_post) & is.finite(dists_post)
+        ]
+
+        n_disconnected <- length(post_cap_nodes) - length(reachable_post)
+
+        if (n_disconnected > 0) {
+          cat(sprintf("    ★ Step1e3 connectivity check: %d nodes disconnected from %s, removing...\n",
+                      n_disconnected, focus_gene_for_ego))
+
+          net_edges <- net_edges %>%
+            filter(TF_Gene %in% reachable_post & Target_Gene %in% reachable_post)
+
+          cat(sprintf("       Edges after reconnect filter: %d\n", nrow(net_edges)))
+        } else {
+          cat("    ★ Step1e3 connectivity check: all nodes reachable, OK\n")
+        }
+      }
     }
 
     # --- Step 1f: 构建节点元数据 ---
@@ -1007,11 +1142,11 @@ if ("barplot" %in% PARAMS$plots_vec) {
 }
 
 # ========================================================================
-# 图 4: Anchor-Based Directed Network (v4.2: 含 Ego-Network 信息)
+# 图 4: Anchor-Based Directed Network (v4.4: 参数化 Degree)
 # ========================================================================
 
 if ("network" %in% PARAMS$plots_vec) {
-  cat("\n--- 图 4: Anchor-Based Directed Network (v4.2) ---\n")
+  cat("\n--- 图 4: Anchor-Based Directed Network (v4.4) ---\n")
 
   plot_results[["network"]] <- tryCatch({
 
@@ -1154,7 +1289,8 @@ if ("network" %in% PARAMS$plots_vec) {
           pruned_class_counts["Gained"] %||% 0,
           pruned_class_counts["Rewired"] %||% 0,
           pruned_class_counts["Conserved"] %||% 0),
-        caption = sprintf("Pruning: Conserved excl. from degree | %s | Layout: %s | Seed: %d",
+        caption = sprintf("Pruning: Conserved excl. from degree | deg1_all=%s, deg1_focus=%s | %s | Layout: %s | Seed: %d",
+          PARAMS$network_keep_deg1_all, PARAMS$network_keep_deg1_focus,
           ego_note, layout_algo, PARAMS$network_seed)
       )
 
@@ -1202,7 +1338,8 @@ if ("network" %in% PARAMS$plots_vec) {
       n_final_nodes = final_n, n_final_edges = final_e,
       edge_class_counts = as.list(pruned_class_counts),
       node_type_counts = as.list(table(node_meta$NodeType)),
-      pruning_note = "v3.0: Conserved edges excluded from effective degree",
+      pruning_note = sprintf("v4.4: keep_deg1_all=%s, keep_deg1_focus=%s",
+                            PARAMS$network_keep_deg1_all, PARAMS$network_keep_deg1_focus),
       ego_filter = list(
         applied       = network_data$ego_filter_applied,
         ego_steps     = network_data$ego_steps_used,
@@ -1922,10 +2059,12 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
 
     # ★ v4.2: Summary JSON 含 ego 过滤信息
     fig7_summary <- list(
-      version           = "v4.2",
+      version           = "v4.4",
       changes           = list(
         "v4.1: directional boxes, Fig7a/7b layout",
-        "v4.2: ego-network topological constraint applied before visualization"
+        "v4.2: ego-network topological constraint applied before visualization",
+        "v4.3: post-cap connectivity re-check; network_max_nodes → network_max_edges",
+        "v4.4: parameterized degree-1 control; post-cap degree re-pruning"
       ),
       ego_filter = list(
         applied       = network_data$ego_filter_applied,
@@ -1972,7 +2111,7 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
 # ========================================================================
 
 cat("\n================================================================================\n")
-cat("  Pipeline 7c: Visualization Complete (v4.2)\n")
+cat("  Pipeline 7c: Visualization Complete (v4.4)\n")
 cat("================================================================================\n\n")
 
 cat(sprintf("结束时间: %s\n\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))

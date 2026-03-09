@@ -89,7 +89,9 @@ LABEL_TOP_N="${GRN_LABEL_TOP_N:-15}"
 LABEL_FOCUS="${GRN_LABEL_FOCUS:-TRUE}"
 SHOW_HEATMAP_STARS="${GRN_SHOW_HEATMAP_STARS:-FALSE}"
 
-NETWORK_MAX_NODES="${GRN_NETWORK_MAX_NODES:-200}"
+NETWORK_MAX_EDGES="${GRN_NETWORK_MAX_EDGES:-600}"
+NETWORK_KEEP_DEG1_ALL="${GRN_NETWORK_KEEP_DEG1_ALL:-FALSE}"
+NETWORK_KEEP_DEG1_FOCUS="${GRN_NETWORK_KEEP_DEG1_FOCUS:-FALSE}"
 NETWORK_LAYOUT="${GRN_NETWORK_LAYOUT:-kk}"
 NETWORK_SEED="${GRN_NETWORK_SEED:-42}"
 NETWORK_PRUNE="${GRN_NETWORK_PRUNE:-TRUE}"
@@ -173,10 +175,12 @@ usage() {
     echo "  --label_top_n N       Top N nodes to label (default: ${LABEL_TOP_N})"
     echo "  --label_focus BOOL    Label focus genes (default: ${LABEL_FOCUS})"
     echo "  --show_heatmap_stars  Show stars on heatmap (default: ${SHOW_HEATMAP_STARS})"
-    echo "  --network_max_nodes N Max nodes in network (default: ${NETWORK_MAX_NODES})"
-    echo "  --network_layout L    Layout algorithm: kk/fr/circle (default: ${NETWORK_LAYOUT})"
+    echo "  --network_max_edges N Max edges in network (default: ${NETWORK_MAX_EDGES})"
+    echo "  --network_keep_deg1_all BOOL  Keep all TF deg=1 targets (default: ${NETWORK_KEEP_DEG1_ALL})"
+    echo "  --network_keep_deg1_focus BOOL Keep focus gene deg=1 targets (default: ${NETWORK_KEEP_DEG1_FOCUS})"
+    echo "  --network_layout L    Layout algorithm: kk/fr/stress (default: ${NETWORK_LAYOUT})"
     echo "  --network_seed N      Network layout seed (default: ${NETWORK_SEED})"
-    echo "  --network_prune BOOL  Prune network (default: ${NETWORK_PRUNE})"
+    echo "  --network_prune BOOL  Prune degree-1 targets (default: ${NETWORK_PRUNE})"
     echo "  --network_fig_w N     Network figure width (default: ${NETWORK_FIG_W})"
     echo "  --network_fig_h N     Network figure height (default: ${NETWORK_FIG_H})"
     echo "  --network_arrow_mm N  Arrow size in mm (default: ${NETWORK_ARROW_MM})"
@@ -247,7 +251,9 @@ while [[ $# -gt 0 ]]; do
         --label_top_n)        LABEL_TOP_N="$2";          shift 2 ;;
         --label_focus)        LABEL_FOCUS="$2";          shift 2 ;;
         --show_heatmap_stars) SHOW_HEATMAP_STARS="$2";   shift 2 ;;
-        --network_max_nodes)  NETWORK_MAX_NODES="$2";    shift 2 ;;
+        --network_max_edges)  NETWORK_MAX_EDGES="$2";    shift 2 ;;
+        --network_keep_deg1_all)   NETWORK_KEEP_DEG1_ALL="$2";   shift 2 ;;
+        --network_keep_deg1_focus) NETWORK_KEEP_DEG1_FOCUS="$2"; shift 2 ;;
         --network_layout)     NETWORK_LAYOUT="$2";       shift 2 ;;
         --network_seed)       NETWORK_SEED="$2";         shift 2 ;;
         --network_prune)      NETWORK_PRUNE="$2";        shift 2 ;;
@@ -511,7 +517,7 @@ fi
 # ========================================================
 if [ "${RUN_7C}" == "TRUE" ]; then
     echo "================================================="
-    echo " [Step C] Network Visualization (v4.2.1)"
+    echo " [Step C] Network Visualization (v4.4)"
     echo "================================================="
     echo ""
 
@@ -611,7 +617,9 @@ if [ "${RUN_7C}" == "TRUE" ]; then
         "--label_top_n"             "${LABEL_TOP_N}"
         "--label_focus"             "${LABEL_FOCUS}"
         "--show_heatmap_stars"      "${SHOW_HEATMAP_STARS}"
-        "--network_max_nodes"       "${NETWORK_MAX_NODES}"
+        "--network_max_edges"       "${NETWORK_MAX_EDGES}"
+        "--network_keep_deg1_all"   "${NETWORK_KEEP_DEG1_ALL}"
+        "--network_keep_deg1_focus" "${NETWORK_KEEP_DEG1_FOCUS}"
         "--network_layout"          "${NETWORK_LAYOUT}"
         "--network_seed"            "${NETWORK_SEED}"
         "--network_prune"           "${NETWORK_PRUNE}"

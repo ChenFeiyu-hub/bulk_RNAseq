@@ -327,18 +327,20 @@ GRN_LABEL_TOP_N="15"
 GRN_LABEL_FOCUS="TRUE"
 GRN_SHOW_HEATMAP_STARS="FALSE"           # Fig1: 控制热图显著性星号
 
-# --- Fig4 网络图参数 (v2.1 锚定网络) ---
-GRN_NETWORK_MAX_NODES="200"              # 最大节点数 (安全上限)
+# --- Fig4 网络图参数 (v4.4) ---
+GRN_NETWORK_MAX_EDGES="500"              # 直接控制边数上限
+GRN_NETWORK_KEEP_DEG1_ALL="FALSE"        # 保留所有TF的 degree=1 target
+GRN_NETWORK_KEEP_DEG1_FOCUS="TRUE"      # 单独豁免 focus gene 的 degree=1 target
+GRN_NETWORK_PRUNE="TRUE"                 # 控制 degree 剪枝总开关
 GRN_NETWORK_LAYOUT="kk"                  # kk / fr / stress
 GRN_NETWORK_SEED="42"                    # 布局随机种子
-GRN_NETWORK_PRUNE="TRUE"                 # 智能剪枝: 移除 degree-1 非核心节点
 GRN_NETWORK_FIG_W="18"                   # 网络图固定宽度 (inches)
 GRN_NETWORK_FIG_H="14"                   # 网络图固定高度 (inches)
-GRN_NETWORK_ARROW_MM="1.5"              # 箭头大小 (mm)
-GRN_NETWORK_EDGE_WIDTH_MIN="0.5"        # 边最小宽度
-GRN_NETWORK_EDGE_WIDTH_MAX="2.0"        # 边最大宽度
-GRN_NETWORK_NODE_SIZE_MIN="4"           # 节点最小尺寸
-GRN_NETWORK_NODE_SIZE_MAX="12"          # 节点最大尺寸
+GRN_NETWORK_ARROW_MM="1.5"               # 箭头大小 (mm)
+GRN_NETWORK_EDGE_WIDTH_MIN="0.5"         # 边最小宽度
+GRN_NETWORK_EDGE_WIDTH_MAX="2.0"         # 边最大宽度
+GRN_NETWORK_NODE_SIZE_MIN="4"            # 节点最小尺寸
+GRN_NETWORK_NODE_SIZE_MAX="12"           # 节点最大尺寸
 
 # --- Fig5 Circos 参数 ---
 GRN_CIRCOS_MAX_EDGES="500"
