@@ -2,7 +2,7 @@
 ################################################################################
 # RNAseq Pipeline 7b: Cluster-Constrained Discovery + MECS Scoring
 #
-# 版本: v1.0
+# 版本: v1.1
 #
 # ============================================================================
 # 模块概览
@@ -19,6 +19,17 @@
 #           (S1: 差异共表达 + S2: 聚类约束 + S3: pCRE一致性[可选])
 #
 # ============================================================================
+# v1.1 更新: pCRE 自动解析 (Part 0d)
+# ============================================================================
+# - 新增 --pcre_integrated_dir: 指向 Pipeline 6c 输出目录, 自动解析
+#   Integrated_Features_Full.txt 构建 pCRE-TF Family 映射
+# - DAP-seq DB 命名 (e.g. "C2C2dof_tnt.dof43") 自动宽容匹配
+#   GRN TF family (e.g. "DOF"), 无需手动创建映射文件
+# - 三级优先级: --pcre_tf_map > --pcre_integrated_dir > 禁用 S3
+# - 保留 --pcre_family_alias 参数用于个别命名不一致情况
+# - 自动生成审计文件: Pipeline7b_Auto_pCRE_Map.tsv / _FamilyAlias.tsv
+#
+# ============================================================================
 # 工程化泛化设计
 # ============================================================================
 # - --focus_tf_family / --focus_gene 参数化, 不硬编码任何基因/家族
@@ -33,7 +44,8 @@
 #     --rdata_7a /path/to/Pipeline7a_DiffCoexp_Results.RData \
 #     --out_dir /path/to/07_GRN \
 #     --focus_tf_family DOF \
-#     --focus_gene Cre06.g250050
+#     --focus_gene Cre06.g250050 \
+#     --pcre_integrated_dir /path/to/Pipeline6c_output
 #
 ################################################################################
 
@@ -53,7 +65,10 @@ parse_arguments <- function() {
     # ========== 数据输入 ==========
     rdata_7a          = NULL,        # [必需] Pipeline7a RData
     cluster_pairs     = NULL,        # [可选] Cluster pair TSV
-    pcre_tf_map       = NULL,        # [可选] pCRE-TF mapping TSV
+    pcre_tf_map       = NULL,        # [可选] pCRE-TF mapping TSV (手动, 最高优先级)
+    pcre_integrated_dir = NULL,      # [可选] Pipeline 6c 输出目录 (自动解析 pCRE)
+    pcre_family_alias = "",          # [可选] 手动别名 (e.g. "C2C2dof=DOF,C2C2gata=GATA")
+    pcre_min_pcc      = 0.0,         # [可选] pCRE DB Match 最低 PCC 过滤
     highlight_file    = NULL,        # [可选] Highlight genes (覆盖 7a 中的)
 
     # ========== 输出 ==========
@@ -145,7 +160,7 @@ if (is.null(PARAMS$rdata_7a)) {
 
 cat("================================================================================\n")
 cat("  Pipeline 7b: Cluster-Constrained Discovery + MECS Scoring\n")
-cat("  v1.0 - Generalized Engineering Framework\n")
+cat("  v1.1 - Generalized Engineering Framework + pCRE Auto-Parse\n")
 cat("================================================================================\n\n")
 cat(sprintf("开始时间: %s\n\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))
 
@@ -353,21 +368,340 @@ cat(sprintf("  Total focus TFs: %d\n", length(focus_tfs)))
 cat(sprintf("  Module D will %s\n", ifelse(has_focus, "run", "be skipped")))
 
 # ========================================================================
-# Part 0d: 加载 pCRE 信息 (可选)
+# Part 0d: 加载 pCRE 信息 (可选, 三级优先级)
+#
+#   优先级 1: --pcre_tf_map (手动 TSV, 最高优先级)
+#   优先级 2: --pcre_integrated_dir (自动解析 6c Integrated_Features_Full.txt)
+#   优先级 3: 无 pCRE → MECS 退化为 S1+S2
 # ========================================================================
 
 pcre_map <- NULL
 use_pcre <- FALSE
 
+cat("\n--- Part 0d: pCRE 信息加载 ---\n")
+
+# ---- 优先级 1: 手动 TSV ----
 if (!is.null(PARAMS$pcre_tf_map) && file.exists(PARAMS$pcre_tf_map)) {
   pcre_map <- read.table(PARAMS$pcre_tf_map, header = TRUE, sep = "\t",
                           stringsAsFactors = FALSE)
   use_pcre <- TRUE
-  cat(sprintf("\n  pCRE-TF map loaded: %d entries\n", nrow(pcre_map)))
-} else {
-  cat(sprintf("\n  pCRE-TF map not available → MECS degrades to S1+S2\n"))
-  PARAMS$w_pcre <- 0
+  cat(sprintf("  [优先级 1] 手动 pCRE-TF map 加载: %d entries\n", nrow(pcre_map)))
+
+# ---- 优先级 2: 自动解析 6c 输出 ----
+} else if (!is.null(PARAMS$pcre_integrated_dir) &&
+           dir.exists(PARAMS$pcre_integrated_dir)) {
+
+  cat(sprintf("  [优先级 2] 自动解析 Pipeline 6c: %s\n", PARAMS$pcre_integrated_dir))
+
+  # --- Step 1: 搜索 Integrated_Features_Full.txt ---
+  # 支持两种目录结构: {dir}/WT/Integrated_... 或直接 {dir}/Integrated_...
+  wt_integ_path <- NULL
+  candidate_paths <- c(
+    file.path(PARAMS$pcre_integrated_dir, "WT", "Integrated_Features_Full.txt"),
+    file.path(PARAMS$pcre_integrated_dir, "Integrated_Features_Full.txt")
+  )
+  for (cp in candidate_paths) {
+    if (file.exists(cp)) {
+      wt_integ_path <- cp
+      break
+    }
+  }
+
+  if (!is.null(wt_integ_path)) {
+    cat(sprintf("  ✔ 找到 WT 整合表: %s\n", basename(wt_integ_path)))
+
+    integ_raw <- tryCatch(
+      read.table(wt_integ_path, header = TRUE, sep = "\t",
+                  stringsAsFactors = FALSE, quote = "", fill = TRUE,
+                  check.names = FALSE),
+      error = function(e) {
+        cat(sprintf("  ⚠ 读取失败: %s\n", e$message))
+        NULL
+      }
+    )
+
+    if (!is.null(integ_raw) && nrow(integ_raw) > 0) {
+
+      # --- Step 2: 识别关键列名 (兼容 6c 不同版本的列名) ---
+      db_match_cols <- character(0)
+      pcc_cols      <- character(0)
+      imp_col_name  <- NULL
+      cluster_col   <- NULL
+      kmer_col_name <- NULL
+
+      # DB Match 列: 尝试多种命名
+      for (pattern in c("Kmer_DB_Match_1", "DB_Match_1", "Kmer_DB_Match1")) {
+        hit <- grep(pattern, colnames(integ_raw), value = TRUE, ignore.case = TRUE)
+        if (length(hit) > 0) { db_match_cols <- c(db_match_cols, hit[1]); break }
+      }
+      for (pattern in c("Kmer_DB_Match_2", "DB_Match_2", "Kmer_DB_Match2")) {
+        hit <- grep(pattern, colnames(integ_raw), value = TRUE, ignore.case = TRUE)
+        if (length(hit) > 0) { db_match_cols <- c(db_match_cols, hit[1]); break }
+      }
+
+      # PCC 列
+      for (pattern in c("Kmer_PCC_1", "PCC_1")) {
+        hit <- grep(paste0("^", pattern, "$"), colnames(integ_raw), value = TRUE, ignore.case = TRUE)
+        if (length(hit) > 0) { pcc_cols <- c(pcc_cols, hit[1]); break }
+      }
+      for (pattern in c("Kmer_PCC_2", "PCC_2")) {
+        hit <- grep(paste0("^", pattern, "$"), colnames(integ_raw), value = TRUE, ignore.case = TRUE)
+        if (length(hit) > 0) { pcc_cols <- c(pcc_cols, hit[1]); break }
+      }
+
+      # Importance 列
+      for (pattern in c("Importance", "mean_importance", "Mean_Importance")) {
+        if (pattern %in% colnames(integ_raw)) { imp_col_name <- pattern; break }
+      }
+
+      # Cluster 列
+      for (pattern in c("Source_Cluster", "Cluster")) {
+        if (pattern %in% colnames(integ_raw)) { cluster_col <- pattern; break }
+      }
+
+      # Kmer 列
+      for (pattern in c("Kmer", "kmer", "pCRE_Kmer")) {
+        if (pattern %in% colnames(integ_raw)) { kmer_col_name <- pattern; break }
+      }
+
+      cat(sprintf("    DB Match 列: %s\n", paste(db_match_cols, collapse = ", ")))
+      cat(sprintf("    PCC 列:      %s\n", paste(pcc_cols, collapse = ", ")))
+      cat(sprintf("    Importance:  %s | Cluster: %s\n",
+                  ifelse(is.null(imp_col_name), "NA", imp_col_name),
+                  ifelse(is.null(cluster_col), "NA", cluster_col)))
+
+      if (length(db_match_cols) > 0 && !is.null(cluster_col)) {
+
+        # --- Step 3: 提取 DAP-seq DB 中的 TF Family 前缀 ---
+        # DAP naming convention: {Family}_tnt.{gene_name}_...
+        # 例: C2C2dof_tnt.dof43_col_a_m1 → "C2C2dof"
+        #     bHLH_tnt.bHLH28_col_a_m1   → "bHLH"
+        #     TCP_tnt.TCP16_col_a_m1      → "TCP"
+
+        extract_dap_family <- function(db_name_vec) {
+          result <- rep(NA_character_, length(db_name_vec))
+          valid <- !is.na(db_name_vec) & nchar(db_name_vec) > 0
+          # 提取 _tnt. 或 _col 之前的 family 前缀
+          m <- regmatches(db_name_vec[valid],
+                          regexec("^(.+?)_tnt\\.", db_name_vec[valid]))
+          result[valid] <- sapply(m, function(x) {
+            if (length(x) >= 2) x[2] else NA_character_
+          })
+          return(result)
+        }
+
+        # 收集所有 DB Match 中出现的 DAP family
+        all_dap_fams <- character(0)
+        for (dbc in db_match_cols) {
+          extracted <- extract_dap_family(integ_raw[[dbc]])
+          all_dap_fams <- c(all_dap_fams, na.omit(extracted))
+        }
+        unique_dap_fams <- sort(unique(all_dap_fams))
+        cat(sprintf("    发现 %d 个 DAP family 前缀\n", length(unique_dap_fams)))
+
+        # --- Step 4: DAP family → GRN TF family 宽容映射 ---
+        grn_families <- sort(unique(na.omit(tf_family_map)))
+        cat(sprintf("    GRN TF families: %d\n", length(grn_families)))
+
+        # 4a: 解析手动别名 (如 "C2C2dof=DOF,C2C2gata=GATA")
+        manual_alias <- list()
+        if (!is.null(PARAMS$pcre_family_alias) && nchar(PARAMS$pcre_family_alias) > 0) {
+          pairs <- trimws(unlist(strsplit(PARAMS$pcre_family_alias, ",")))
+          for (p in pairs) {
+            kv <- trimws(unlist(strsplit(p, "=")))
+            if (length(kv) == 2) manual_alias[[kv[1]]] <- kv[2]
+          }
+          if (length(manual_alias) > 0) {
+            cat(sprintf("    手动别名: %d 条\n", length(manual_alias)))
+          }
+        }
+
+        # 4b: 宽容匹配 (tolower 双向 containment)
+        dap_to_grn <- setNames(rep(NA_character_, length(unique_dap_fams)),
+                                unique_dap_fams)
+
+        for (dap_fam in unique_dap_fams) {
+          # 先查手动别名
+          if (dap_fam %in% names(manual_alias)) {
+            dap_to_grn[dap_fam] <- manual_alias[[dap_fam]]
+            next
+          }
+
+          dap_lower <- tolower(dap_fam)
+          best_match <- NA_character_
+          best_score <- 0L
+
+          for (grn_fam in grn_families) {
+            grn_lower <- tolower(grn_fam)
+
+            # 策略 1: 完全一致 (最高优先)
+            if (dap_lower == grn_lower) {
+              best_match <- grn_fam
+              best_score <- 100L
+              break
+            }
+
+            # 策略 2: GRN family 名作为子串出现在 DAP family 中
+            # e.g. "DOF" 在 "C2C2dof" 中, "WRKY" 在 "WRKY" 中
+            if (grepl(grn_lower, dap_lower, fixed = TRUE)) {
+              score <- nchar(grn_fam)  # 越长越精确
+              if (score > best_score) {
+                best_match <- grn_fam
+                best_score <- score
+              }
+            }
+
+            # 策略 3: DAP family 名作为子串出现在 GRN family 中
+            # e.g. "TCP" 在 "TCP" 中 (反向兼容)
+            if (grepl(dap_lower, grn_lower, fixed = TRUE)) {
+              score <- nchar(dap_fam)
+              if (score > best_score) {
+                best_match <- grn_fam
+                best_score <- score
+              }
+            }
+          }
+
+          dap_to_grn[dap_fam] <- best_match
+        }
+
+        # 报告映射结果
+        n_mapped <- sum(!is.na(dap_to_grn))
+        n_unmapped <- sum(is.na(dap_to_grn))
+        cat(sprintf("    映射成功: %d / %d DAP families\n", n_mapped, length(dap_to_grn)))
+        if (n_unmapped > 0 && n_unmapped <= 20) {
+          cat(sprintf("    ⚠ 未映射: %s\n",
+                      paste(names(dap_to_grn)[is.na(dap_to_grn)], collapse = ", ")))
+        } else if (n_unmapped > 20) {
+          cat(sprintf("    ⚠ 未映射: %d 个 (过多, 仅显示前 10)\n", n_unmapped))
+          cat(sprintf("      %s ...\n",
+                      paste(head(names(dap_to_grn)[is.na(dap_to_grn)], 10), collapse = ", ")))
+        }
+
+        # 显示成功的映射关系
+        mapped_idx <- !is.na(dap_to_grn)
+        if (sum(mapped_idx) > 0 && sum(mapped_idx) <= 30) {
+          cat("    映射表:\n")
+          for (dap_fam in names(dap_to_grn)[mapped_idx]) {
+            cat(sprintf("      %s → %s\n", dap_fam, dap_to_grn[dap_fam]))
+          }
+        }
+
+        # --- Step 5: 构建 pcre_map ---
+        # 逐行提取: 每行 kmer 的 DB Match → DAP family → GRN TF family
+        # 然后按 (Cluster, TF_Family) 聚合取最高 Importance
+
+        min_pcc <- as.numeric(PARAMS$pcre_min_pcc)
+
+        # 长表: 每条 DB match 展开为一行
+        record_list <- list()
+        rec_idx <- 0L
+
+        for (dbc_i in seq_along(db_match_cols)) {
+          dbc <- db_match_cols[dbc_i]
+          pcc_c <- if (dbc_i <= length(pcc_cols)) pcc_cols[dbc_i] else NULL
+
+          dap_fams <- extract_dap_family(integ_raw[[dbc]])
+          grn_fams <- dap_to_grn[dap_fams]
+
+          for (row_i in which(!is.na(grn_fams))) {
+            # PCC 过滤
+            if (!is.null(pcc_c) && min_pcc > 0) {
+              pcc_val <- suppressWarnings(as.numeric(integ_raw[[pcc_c]][row_i]))
+              if (is.na(pcc_val) || pcc_val < min_pcc) next
+            }
+
+            # 提取 cluster 编号 (e.g. "WT_C3" → 3)
+            cl_raw <- integ_raw[[cluster_col]][row_i]
+            cl_num <- suppressWarnings(
+              as.integer(gsub("[^0-9]", "", cl_raw))
+            )
+            if (is.na(cl_num)) next
+
+            imp_val <- if (!is.null(imp_col_name)) {
+              suppressWarnings(as.numeric(integ_raw[[imp_col_name]][row_i]))
+            } else { 1.0 }
+            if (is.na(imp_val)) imp_val <- 0
+
+            rec_idx <- rec_idx + 1L
+            record_list[[rec_idx]] <- data.frame(
+              WT_Cluster  = cl_num,
+              TF_Family   = grn_fams[row_i],
+              Importance  = imp_val,
+              stringsAsFactors = FALSE
+            )
+          }
+        }
+
+        if (length(record_list) > 0) {
+          pcre_long <- do.call(rbind, record_list)
+          cat(sprintf("    原始匹配记录: %d 行\n", nrow(pcre_long)))
+
+          # 按 (WT_Cluster, TF_Family) 聚合:
+          # - 取该组合中最大 Importance 作为代表值
+          pcre_agg <- pcre_long %>%
+            group_by(WT_Cluster, TF_Family) %>%
+            summarise(
+              Max_Importance = max(Importance, na.rm = TRUE),
+              N_Hits = n(),
+              .groups = "drop"
+            ) %>%
+            arrange(WT_Cluster, desc(Max_Importance))
+
+          # 在每个 Cluster 内按 Max_Importance 排名
+          pcre_agg <- pcre_agg %>%
+            group_by(WT_Cluster) %>%
+            mutate(Importance_Rank = rank(-Max_Importance, ties.method = "min")) %>%
+            ungroup()
+
+          pcre_map <- as.data.frame(pcre_agg)
+          use_pcre <- TRUE
+
+          cat(sprintf("  ✔ pCRE map 自动生成: %d 条 (Cluster×Family)\n", nrow(pcre_map)))
+          cat(sprintf("    覆盖 Cluster: %s\n",
+                      paste(sort(unique(pcre_map$WT_Cluster)), collapse = ", ")))
+          cat(sprintf("    覆盖 TF Family: %d 个\n",
+                      length(unique(pcre_map$TF_Family))))
+
+          # 保存自动生成的 map 供审计
+          auto_map_path <- file.path(OUT_7B, "Pipeline7b_Auto_pCRE_Map.tsv")
+          write.table(pcre_map, auto_map_path,
+                      sep = "\t", quote = FALSE, row.names = FALSE)
+          cat(sprintf("    已保存: %s\n", basename(auto_map_path)))
+
+          # 保存映射字典
+          alias_df <- data.frame(
+            DAP_Family = names(dap_to_grn),
+            GRN_Family = unname(dap_to_grn),
+            Mapped = !is.na(dap_to_grn),
+            stringsAsFactors = FALSE
+          )
+          alias_path <- file.path(OUT_7B, "Pipeline7b_Auto_pCRE_FamilyAlias.tsv")
+          write.table(alias_df, alias_path,
+                      sep = "\t", quote = FALSE, row.names = FALSE)
+
+        } else {
+          cat("  ⚠ 未能从 6c 数据中构建任何 pCRE 映射\n")
+        }
+      } else {
+        cat("  ⚠ 6c 整合表缺少必要列 (DB_Match / Cluster)\n")
+        cat(sprintf("    可用列: %s\n", paste(colnames(integ_raw), collapse = ", ")))
+      }
+    }
+  } else {
+    cat(sprintf("  ⚠ 未找到 WT 整合表, 已搜索:\n"))
+    for (cp in candidate_paths) cat(sprintf("    %s\n", cp))
+  }
 }
+
+# ---- 最终状态: 如果仍无 pCRE 信息 ----
+if (!use_pcre) {
+  cat("  pCRE 数据不可用 → MECS 退化为 S1+S2\n")
+  PARAMS$w_pcre <- 0
+} else {
+  cat(sprintf("  ✔ pCRE S3 已启用 (w_pcre = %.1f)\n", PARAMS$w_pcre))
+}
+
 
 # ========================================================================
 # Part 0e: 为边表添加 cluster pair 信息
@@ -1275,7 +1609,7 @@ cat("========================================================================\n"
 # 全局摘要
 summary_lines <- c(
   "================================================================================",
-  "  Pipeline 7b: Cluster-Constrained Discovery Summary (v1.0)",
+  "  Pipeline 7b: Cluster-Constrained Discovery Summary (v1.1)",
   "================================================================================",
   "",
   sprintf("Analysis Time: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
@@ -1316,12 +1650,19 @@ cat("  Summary saved\n")
 # Parameters JSON
 params_json <- list(
   pipeline = "7b",
-  version = "1.0",
-  description = "Cluster-Constrained Discovery + MECS Multi-Evidence Scoring",
+  version = "1.1",
+  description = "Cluster-Constrained Discovery + MECS Multi-Evidence Scoring (pCRE Auto-Parse)",
   input = list(
     rdata_7a = PARAMS$rdata_7a,
     cluster_pairs = PARAMS$cluster_pairs,
     pcre_tf_map = PARAMS$pcre_tf_map,
+    pcre_integrated_dir = PARAMS$pcre_integrated_dir,
+    pcre_family_alias = PARAMS$pcre_family_alias,
+    pcre_min_pcc = PARAMS$pcre_min_pcc,
+    pcre_source = ifelse(use_pcre,
+      ifelse(!is.null(PARAMS$pcre_tf_map) && file.exists(PARAMS$pcre_tf_map),
+             "manual_tsv", "auto_6c"),
+      "none"),
     highlight_file = PARAMS$highlight_file
   ),
   focus = list(
@@ -1402,7 +1743,7 @@ cat("  RData saved: Pipeline7b_Discovery_Results.RData\n")
 ################################################################################
 
 cat("\n================================================================================\n")
-cat("  Pipeline 7b 完成 (v1.0)\n")
+cat("  Pipeline 7b 完成 (v1.1)\n")
 cat("================================================================================\n\n")
 cat(sprintf("结束时间: %s\n\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))
 
@@ -1419,6 +1760,10 @@ if (has_focus) {
 }
 cat("    ├── Pipeline7b_MECS_Scored_Edges.tsv\n")
 cat("    ├── Pipeline7b_MECS_Summary.txt\n")
+if (use_pcre && !is.null(PARAMS$pcre_integrated_dir)) {
+  cat("    ├── Pipeline7b_Auto_pCRE_Map.tsv\n")
+  cat("    ├── Pipeline7b_Auto_pCRE_FamilyAlias.tsv\n")
+}
 cat("    ├── Pipeline7b_Summary.txt\n")
 cat("    ├── Pipeline7b_Parameters.json\n")
 cat("    ├── Pipeline7b_discovery.log\n")

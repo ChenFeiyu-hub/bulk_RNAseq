@@ -50,7 +50,7 @@ GFF_FILE="/home/cfy/Data/CrDof_project/ref/PhytozomeV13/CreinhardtiiCC_4532/v6.1
 # 基因ID清理正则 (可选, 留空则不做任何剥离)
 # 衣藻示例: GENE_ID_STRIP_PATTERN="_4532(\\.v6\\.1)?$"
 # 地钱: 通常不需要, 留空即可
-GENE_ID_STRIP_PATTERN="_4532(\\.v6\\.1)?$"
+GENE_ID_STRIP_PATTERN="_4532.*$"
 # ================= 5. 可视化工程化配置 (Visualization) =================
 
 # --- A. Condition 颜色 (用于分面图/Venn图) ---
@@ -319,37 +319,47 @@ GRN_MIN_EDGES="5"
 GRN_EDGE_CLASSES="Lost,Gained,Rewired,Conserved"
 
 # ========== 7c 可视化参数 ==========
-GRN_FIG_FORMAT="both"                     # pdf / png / both
+GRN_FIG_FORMAT="both"
 GRN_FIG_DPI="300"
-GRN_FIG_SCALE="1.0"                      # 全局缩放因子
+GRN_FIG_SCALE="1.0"
 GRN_PLOTS="heatmap,volcano,barplot,network,circos,outdegree,alluvial"
 GRN_LABEL_TOP_N="15"
 GRN_LABEL_FOCUS="TRUE"
-GRN_SHOW_HEATMAP_STARS="FALSE"           # Fig1: 控制热图显著性星号
+GRN_SHOW_HEATMAP_STARS="FALSE"
 
 # --- Fig4 网络图参数 (v4.4) ---
-GRN_NETWORK_MAX_EDGES="500"              # 直接控制边数上限
-GRN_NETWORK_KEEP_DEG1_ALL="FALSE"        # 保留所有TF的 degree=1 target
-GRN_NETWORK_KEEP_DEG1_FOCUS="TRUE"      # 单独豁免 focus gene 的 degree=1 target
-GRN_NETWORK_PRUNE="TRUE"                 # 控制 degree 剪枝总开关
-GRN_NETWORK_LAYOUT="kk"                  # kk / fr / stress
-GRN_NETWORK_SEED="42"                    # 布局随机种子
-GRN_NETWORK_FIG_W="18"                   # 网络图固定宽度 (inches)
-GRN_NETWORK_FIG_H="14"                   # 网络图固定高度 (inches)
-GRN_NETWORK_ARROW_MM="1.5"               # 箭头大小 (mm)
-GRN_NETWORK_EDGE_WIDTH_MIN="0.5"         # 边最小宽度
-GRN_NETWORK_EDGE_WIDTH_MAX="2.0"         # 边最大宽度
-GRN_NETWORK_NODE_SIZE_MIN="4"            # 节点最小尺寸
-GRN_NETWORK_NODE_SIZE_MAX="12"           # 节点最大尺寸
+GRN_NETWORK_MAX_EDGES="500"
+GRN_NETWORK_KEEP_DEG1_ALL="FALSE"
+GRN_NETWORK_KEEP_DEG1_FOCUS="TRUE"
+GRN_NETWORK_PRUNE="TRUE"
+GRN_NETWORK_LAYOUT="kk"
+GRN_NETWORK_SEED="42"
+GRN_NETWORK_FIG_W="18"
+GRN_NETWORK_FIG_H="14"
+GRN_NETWORK_ARROW_MM="1.5"
+GRN_NETWORK_EDGE_WIDTH_MIN="0.5"
+GRN_NETWORK_EDGE_WIDTH_MAX="2.0"
+GRN_NETWORK_NODE_SIZE_MIN="4"
+GRN_NETWORK_NODE_SIZE_MAX="12"
+
+# --- v4.5 拓扑约束 ---
+# 注意: 以下两个步数参数作用于不同阶段
+# max_secondary_steps: Step 1b2, 过滤二级锚点 (基于全基因组图到一级锚点距离)
+# ego_steps:           Step 1d2, ego 过滤 (基于已选子图到 focus_gene 距离)
+# 当两者相同时 1b2 几乎被 1d2 覆盖; 建议 max_secondary >= ego 以避免双重淘汰
+GRN_NETWORK_MAX_SECONDARY_STEPS="2"
+GRN_NETWORK_INTRA_COMPLETION="FALSE"   # 默认关闭，恢复 v4.4 hub-spoke 结构
+GRN_NETWORK_SHARED_TARGETS="FALSE"     
+GRN_NETWORK_EGO_STEPS="2"              # 仅保留 focus_gene N 步内的节点
 
 # --- Fig5 Circos 参数 ---
 GRN_CIRCOS_MAX_EDGES="500"
-GRN_CIRCOS_TOP_EDGES="300"               # Edge-Centric Global Ranking top N
+GRN_CIRCOS_TOP_EDGES="300"
 
-# ========== 7d 自动生成highlight列表辅助脚本参数 ==========
-# 如果 GRN_HIGHLIGHT_FILE 为空或文件不存在，自动从以下 cluster 提取基因
-# 基于 pCRE 分析中发现的感兴趣 cluster (如 STOP1 motif 富集的 cluster)
-GRN_AUTO_HIGHLIGHT_CLUSTERS="WT_C8,WT_C9"    # 逗号分隔, 支持 WT_Cx 和 MUT_Cx
-GRN_AUTO_HIGHLIGHT_MAX_PER_CLUSTER=100        # 每 cluster 最多提取基因数
-GRN_AUTO_HIGHLIGHT_HUB_N=30                   # 从 7b 额外提取的 hub 基因数
-GRN_NETWORK_EGO_STEPS=3                       # 自动模式下 3 步 ego (默认为 2)
+# ========== 7d 自动生成 highlight 列表参数 (v4.6) ==========
+GRN_AUTO_HIGHLIGHT_CLUSTERS="WT_C3"
+GRN_AUTO_HIGHLIGHT_MAX_PER_CLUSTER=50
+# MECS 质量过滤门槛 (v4.6 新增)
+GRN_AUTO_HIGHLIGHT_MIN_TIER=3             # 基因须参与 Tier <= N 的边
+GRN_AUTO_HIGHLIGHT_MIN_EDGE_COUNT=1       # 基因须参与的最小边数
+# 已移除: GRN_AUTO_HIGHLIGHT_HUB_N (v4.6 不再提取 hub target)

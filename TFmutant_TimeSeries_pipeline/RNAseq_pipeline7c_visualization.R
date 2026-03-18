@@ -2,7 +2,81 @@
 ################################################################################
 # RNAseq Pipeline 7c: GRN Network Visualization
 #
-# 版本: v4.4 (参数化 Degree 控制 + 截断后重剪枝)
+# 版本: v4.7 (全流程 Gene ID 标准化)
+#
+# ============================================================================
+# v4.7 更新日志 (基于 v4.6)
+# ============================================================================
+# ★ 核心修复: 全流程 Gene ID 标准化 (stripped ⇄ raw 双向映射)
+#
+# 问题根因:
+#   7d 对 membership matrix 中的基因 ID 执行了 gene_id_strip 处理,
+#   输出 stripped 格式 ID (如 Cre07.g325741);
+#   而 7c 的 edge_source (来自 RData) 保留原始格式 (如 Cre07.g325741_4532.v6.1).
+#   两种格式在 intersect / %in% 比对时完全不匹配, 导致:
+#     - Step 1b2 拓扑筛选: secondary_in_graph = 0 → 全部次级锚点丢失
+#     - Step 1f: Is_Highlight = FALSE (highlight 无法匹配到节点)
+#     - Fig7 evidence heatmap: 如 DESeq2 用不同格式也可能丢失基因
+#
+# 解决方案:
+#   1. 新增 standardize_ids(), build_id_lookup(), resolve_to_raw(),
+#      resolve_to_stripped() 四个辅助函数
+#   2. 从 edge_source 提取全部原始 ID, 构建 stripped→raw 双向查找表
+#   3. 加载 highlight 后立即将其 key 从 stripped 归一化到 raw 格式
+#   4. 同步处理 tf_family_map, cluster_annotation 等可能受影响的映射
+#   5. Cytoscape / 证据热图导出统一使用 shorten_id() 输出清洁格式
+#   6. Fig7 DESeq2 基因池匹配增加 smart fallback: 如直接匹配产出不足,
+#      自动尝试 stripped 格式交叉匹配
+#
+# ============================================================================
+# v4.6 更新日志 (基于 v4.5)
+# ============================================================================
+# 1. Step 1c2 网络内边补全参数化:
+#    - 新增 --network_intra_completion (默认 FALSE)
+#    - v4.5 中此步骤强制执行, 在密集网络中导致 +720 边膨胀
+#    - 关闭后恢复 v4.4 的稀疏 hub-spoke 拓扑结构
+#
+# 2. 上游 7d 脚本简化 (v4.6):
+#    - 移除 dual-mode (full/cluster_filter), 统一为 MECS 过滤模式
+#    - 移除 hub target 和全局 TF 补充 (Source B/C)
+#    - 新增 --min_tier / --min_edge_count MECS 质量门槛
+#
+# 3. Gene ID 清理参数化 (v4.6):
+#    - 新增 --gene_id_strip (从 config GENE_ID_STRIP_PATTERN 传入)
+#    - 替换原硬编码 shorten_id() = sub("_.*$", "", x)
+#    - 有 pattern 时 gsub 精确剥离; 无 pattern 时保持原样
+#    - 统一影响所有可视化标签: Fig4 网络, Fig5 Circos, Fig7 热图, Cytoscape CSV
+#
+# ============================================================================
+# v4.5 更新日志 (基于 v4.4)
+# ============================================================================
+# 1. 分级锚点体系:
+#    - highlight 文件支持三列格式 (Symbol, Gene, Source)
+#    - Source = "primary" 为一级锚点, "secondary" 为二级锚点
+#    - 二级锚点经拓扑筛选: 须在 max_secondary_steps 步内连到任一一级锚点
+#    - 无用户 highlight 时 (纯 auto 模式), 全部标记为 primary, 行为与 v4.4 一致
+#
+# 2. 网络内边补全 (Step 1c2):
+#    - 默认执行, 非参数控制
+#    - 对 Step 1c 选出的所有节点, 补全它们之间在 edge_source 中的遗漏显著边
+#    - 不引入新节点, 仅补边
+#
+# 3. 共享靶标发现 (Step 1c3):
+#    - 默认执行
+#    - 对网络中每个 TF, 查找其与 focus_gene 在 edge_source 中的共享靶标
+#    - 共享靶标及其关联边被引入网络
+#    - 可通过 --network_shared_targets FALSE 关闭
+#
+# 4. Safety cap 分级截断:
+#    - Level 1: 至少一端为一级锚点的边 (最高优先)
+#    - Level 2: 至少一端为二级锚点的边 (次优先)
+#    - Level 3: 其余边 (如共享靶标引入的边, 按 MECS 排序取剩余配额)
+#
+# 5. 处理链路:
+#    1b2(二级筛选) → 1c(锚定边) → 1c2(边补全) → 1c3(共享靶标)
+#    → 1d(degree) → 1d2(ego) → 1e(分级cap) → 1e2(重剪枝) → 1e3(连通性)
+#
+# 6. Shell 层新增 -n/--step-net 参数: 仅执行 7c 中的 Fig4 网络图
 #
 # ============================================================================
 # v4.4 更新日志 (基于 v4.3)
@@ -105,6 +179,12 @@ parse_arguments <- function() {
     # ★ v4.4: Degree-1 target 保留控制
     network_keep_deg1_all   = FALSE,   # 保留所有TF的 degree=1 target
     network_keep_deg1_focus = FALSE,   # 单独豁免 focus gene 的 degree=1 target
+    # ★ v4.5: 分级锚点 + 共享靶标
+    network_max_secondary_steps = 2,    # 二级锚点到一级锚点的最大拓扑距离
+    network_intra_completion    = FALSE, # ★ v4.6: 网络内边补全 (Step 1c2), 默认关闭
+    network_shared_targets      = TRUE, # 启用共享靶标发现 (Step 1c3)
+    network_only                = FALSE, # 仅生成网络图 (由 shell -n 传入)
+    gene_id_strip               = "",    # ★ v4.6: 基因ID清理正则 (从 config 传入)
     # Fig5 Circos
     circos_max_edges      = 500,
     circos_top_edges      = 300,
@@ -218,8 +298,71 @@ parse_color_string <- function(s) {
   return(unlist(result))
 }
 
-# --- 缩短 Gene ID ---
+# --- 缩短 Gene ID (v4.6: 参数化, 兼容两种模式) ---
+# 默认 fallback: 在 PARAMS 初始化后会根据 gene_id_strip 重新定义.
+# 保留此行仅供 PARAMS 就绪前的极端 fallback 场景.
 shorten_id <- function(x) sub("_.*$", "", x)
+
+# --- ★ v4.7: Gene ID 标准化 (与 7d standardize_ids 一致) ---
+standardize_ids <- function(ids, pattern = "") {
+  if (is.null(pattern) || pattern == "") return(ids)
+  gsub(pattern, "", ids)
+}
+
+# --- ★ v4.7: 双向 ID 查找表 ---
+# edge_source 使用原始 ID (如 Cre07.g325741_4532.v6.1),
+# 而 highlight 等外部输入可能使用 stripped ID (如 Cre07.g325741).
+# 此函数构建 stripped → raw 的映射, 以及 raw → stripped 的映射.
+# resolve_to_raw() 接受混合格式 ID, 尝试映射到 edge_source 的原始格式.
+.id_lookup <- list(stripped_to_raw = NULL, raw_to_stripped = NULL)
+
+build_id_lookup <- function(raw_ids, strip_pattern) {
+  raw_ids <- unique(raw_ids)
+  stripped <- standardize_ids(raw_ids, strip_pattern)
+  
+  # 构建 stripped → raw 映射 (如有重复 stripped, 保留第一个)
+  s2r <- setNames(raw_ids, stripped)
+  s2r <- s2r[!duplicated(names(s2r))]
+  
+  # 构建 raw → stripped 映射
+  r2s <- setNames(stripped, raw_ids)
+  
+  .id_lookup$stripped_to_raw  <<- s2r
+  .id_lookup$raw_to_stripped  <<- r2s
+  
+  n_differ <- sum(raw_ids != stripped)
+  cat(sprintf("  ★ ID lookup table: %d IDs (%d differ after strip)\n",
+              length(raw_ids), n_differ))
+}
+
+# 将输入 ID 向量解析到 edge_source 的原始格式.
+# 逻辑: 如果 ID 本身就在原始空间中, 直接保留;
+#        否则尝试通过 stripped→raw 映射回去;
+#        都失败则原样保留 (允许后续步骤自然过滤).
+resolve_to_raw <- function(ids) {
+  if (is.null(.id_lookup$stripped_to_raw)) return(ids)
+  
+  raw_set <- names(.id_lookup$raw_to_stripped)
+  s2r     <- .id_lookup$stripped_to_raw
+  
+  vapply(ids, function(x) {
+    if (x %in% raw_set) return(x)             # 已经是原始格式
+    if (x %in% names(s2r)) return(s2r[[x]])    # stripped → raw
+    x                                           # 无法映射, 原样保留
+  }, character(1), USE.NAMES = FALSE)
+}
+
+# 将输入 ID 向量解析到 stripped 格式 (用于 display 或与外部 stripped 数据比对).
+resolve_to_stripped <- function(ids) {
+  if (is.null(.id_lookup$raw_to_stripped)) return(shorten_id(ids))
+  
+  r2s <- .id_lookup$raw_to_stripped
+  
+  vapply(ids, function(x) {
+    if (x %in% names(r2s)) return(r2s[[x]])  # raw → stripped
+    shorten_id(x)                              # fallback
+  }, character(1), USE.NAMES = FALSE)
+}
 
 # --- ★ v4.4: Degree-based target pruning (可复用) ---
 # 该函数在初始剪枝和 safety cap 后均被调用.
@@ -294,7 +437,7 @@ prune_degree1_targets <- function(net_edges, tf_family_map,
 ################################################################################
 
 cat("================================================================================\n")
-cat("  Pipeline 7c: GRN Network Visualization (v4.4)\n")
+cat("  Pipeline 7c: GRN Network Visualization (v4.7)\n")
 cat("================================================================================\n\n")
 cat(sprintf("开始时间: %s\n\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))
 
@@ -315,19 +458,53 @@ PARAMS <- PARAMS_7c
 if (!is.null(PARAMS$highlight_file) && file.exists(PARAMS$highlight_file)) {
   cat("\n  [Update] Loading external highlight file generated by 7d...\n")
   hl_df <- read.table(PARAMS$highlight_file, header = FALSE, sep = "\t",
-                      stringsAsFactors = FALSE, quote = "")
+                      stringsAsFactors = FALSE, quote = "", fill = TRUE)
   
   # 自动识别是否有表头
-  if (grepl("^(Symbol|Gene)", hl_df[1,1], ignore.case=TRUE)) {
+  if (grepl("^(Symbol|Gene)", hl_df[1,1], ignore.case = TRUE)) {
     colnames(hl_df) <- hl_df[1, ]
     hl_df <- hl_df[-1, ]
   } else {
-    colnames(hl_df) <- c("Symbol", "Gene")
+    if (ncol(hl_df) >= 3) {
+      colnames(hl_df) <- c("Symbol", "Gene", "Source")
+    } else {
+      colnames(hl_df) <- c("Symbol", "Gene")
+    }
+  }
+  
+  # ★ v4.6 fix: 归一化第三列名
+  #   Shell 合并时如果用户文件表头被 awk 处理, 第三列名可能是 "primary" 而非 "Source"
+  #   此处统一修正, 确保 Source 列能被正确识别
+  if (ncol(hl_df) >= 3 && !("Source" %in% colnames(hl_df))) {
+    col3_name <- colnames(hl_df)[3]
+    if (col3_name %in% c("primary", "secondary", "cluster_filtered")) {
+      cat(sprintf("  [Fix] Renaming column 3 '%s' → 'Source'\n", col3_name))
+      colnames(hl_df)[3] <- "Source"
+    }
   }
   
   # 覆盖从 7b 继承的 highlight_map
   highlight_map <- setNames(hl_df$Symbol, hl_df$Gene)
-  cat(sprintf("  Highlight genes updated to: %d genes\n", length(highlight_map)))
+  
+  # ★ v4.5: 解析来源标记
+  if ("Source" %in% colnames(hl_df)) {
+    highlight_source_map <- setNames(hl_df$Source, hl_df$Gene)
+  } else {
+    # 无第三列: 全部视为 primary
+    highlight_source_map <- setNames(rep("primary", nrow(hl_df)), hl_df$Gene)
+  }
+  
+  n_pri <- sum(highlight_source_map == "primary")
+  n_sec <- sum(highlight_source_map == "secondary")
+  cat(sprintf("  Highlight genes updated: %d total (primary=%d, secondary=%d)\n",
+              length(highlight_map), n_pri, n_sec))
+} else {
+  # 无外部 highlight 文件: 初始化空 source map
+  highlight_source_map <- if (!is.null(highlight_map) && length(highlight_map) > 0) {
+    setNames(rep("primary", length(highlight_map)), names(highlight_map))
+  } else {
+    setNames(character(0), character(0))
+  }
 }
 
 # 继承 focus 参数
@@ -372,8 +549,114 @@ cat(sprintf("  v4.4 params: ego_steps=%d, max_edges=%d, keep_deg1_all=%s, keep_d
             PARAMS$network_keep_deg1_all, PARAMS$network_keep_deg1_focus))
 cat(sprintf("               show_heatmap_stars=%s, circos_top_edges=%d\n",
             PARAMS$show_heatmap_stars, PARAMS$circos_top_edges))
+cat(sprintf("  v4.5 params: max_secondary_steps=%d, intra_completion=%s, shared_targets=%s\n",
+            PARAMS$network_max_secondary_steps, PARAMS$network_intra_completion,
+            PARAMS$network_shared_targets))
+cat(sprintf("  v4.6 params: gene_id_strip='%s'\n", PARAMS$gene_id_strip))
 cat(sprintf("  v4.0 new: deseq2_rdata=%s\n",
             ifelse(is.null(PARAMS$deseq2_rdata), "NULL", basename(PARAMS$deseq2_rdata))))
+
+# ========================================================================
+# ★ v4.6: 参数化 Gene ID 清理函数
+# ========================================================================
+# 有 strip pattern 时用 gsub 精确剥离后缀 (如 _4532.v6.1);
+# 无 pattern 时保持原始 ID 不做任何处理 (如地钱等物种).
+# 此处重新定义 shorten_id, 覆盖辅助函数区的 fallback 版本.
+# 全脚本所有可视化标签 (Fig4/5/7, Cytoscape) 均通过此函数统一处理.
+# ========================================================================
+
+if (nzchar(PARAMS$gene_id_strip)) {
+  .gene_id_strip_pattern <- PARAMS$gene_id_strip
+  shorten_id <- function(x) gsub(.gene_id_strip_pattern, "", x)
+  cat(sprintf("  ★ Gene ID strip: active (pattern='%s')\n", .gene_id_strip_pattern))
+} else {
+  .gene_id_strip_pattern <- ""
+  shorten_id <- function(x) x
+  cat("  ★ Gene ID strip: inactive (IDs unchanged)\n")
+}
+
+# ========================================================================
+# ★ v4.7: 构建全局 ID 查找表 (stripped ⇄ raw)
+# ========================================================================
+# 从 RData 中继承的 edge table 提取所有原始基因 ID,
+# 建立 stripped → raw 双向映射, 供后续 highlight / anchor 解析使用.
+# ========================================================================
+{
+  .edge_for_lookup <- NULL
+  if (exists("edge_table_scored") && is.data.frame(edge_table_scored))
+    .edge_for_lookup <- edge_table_scored
+  else if (exists("scored_edges") && is.data.frame(scored_edges))
+    .edge_for_lookup <- scored_edges
+
+  if (!is.null(.edge_for_lookup) &&
+      "TF_Gene" %in% names(.edge_for_lookup) &&
+      "Target_Gene" %in% names(.edge_for_lookup)) {
+    .all_raw_ids <- unique(c(.edge_for_lookup$TF_Gene, .edge_for_lookup$Target_Gene))
+    build_id_lookup(.all_raw_ids, .gene_id_strip_pattern)
+    rm(.all_raw_ids)
+  } else {
+    cat("  ★ ID lookup table: skipped (no edge table found yet)\n")
+  }
+  rm(.edge_for_lookup)
+}
+
+# ========================================================================
+# ★ v4.7: 将 highlight / source map 的 key 从 stripped → raw 格式
+# ========================================================================
+# 7d 输出的 Gene 列经过 gene_id_strip 处理, 可能是 stripped 格式;
+# 而 7c 的 edge_source 保留原始格式. 在此统一将 highlight_map 和
+# highlight_source_map 的 key 转为 raw 格式, 确保后续 anchor 选取和
+# node_meta 匹配均在同一 ID 空间下进行.
+# 同时处理 tf_family_map 的 key (通常已经是 raw, 但做兼容性检查).
+# ========================================================================
+
+if (!is.null(.id_lookup$stripped_to_raw) && nzchar(.gene_id_strip_pattern)) {
+
+  # --- 归一化 highlight_map ---
+  if (!is.null(highlight_map) && length(highlight_map) > 0) {
+    old_keys <- names(highlight_map)
+    new_keys <- resolve_to_raw(old_keys)
+    n_resolved <- sum(old_keys != new_keys)
+    
+    names(highlight_map) <- new_keys
+    # 去除因映射后可能产生的重复
+    highlight_map <- highlight_map[!duplicated(names(highlight_map))]
+    
+    cat(sprintf("  ★ Highlight IDs normalized: %d resolved to raw format\n", n_resolved))
+  }
+  
+  # --- 归一化 highlight_source_map ---
+  if (exists("highlight_source_map") && length(highlight_source_map) > 0) {
+    old_keys <- names(highlight_source_map)
+    new_keys <- resolve_to_raw(old_keys)
+    names(highlight_source_map) <- new_keys
+    highlight_source_map <- highlight_source_map[!duplicated(names(highlight_source_map))]
+  }
+  
+  # --- 归一化 tf_family_map (防御性, 通常不需要) ---
+  if (exists("tf_family_map") && length(tf_family_map) > 0) {
+    old_keys_tf <- names(tf_family_map)
+    new_keys_tf <- resolve_to_raw(old_keys_tf)
+    n_tf_resolved <- sum(old_keys_tf != new_keys_tf)
+    if (n_tf_resolved > 0) {
+      names(tf_family_map) <- new_keys_tf
+      tf_family_map <- tf_family_map[!duplicated(names(tf_family_map))]
+      cat(sprintf("  ★ TF family map IDs normalized: %d resolved to raw format\n", n_tf_resolved))
+    }
+  }
+  
+  # --- 归一化 cluster_annotation ---
+  if (exists("cluster_annotation") && !is.null(cluster_annotation) &&
+      "Gene_ID" %in% names(cluster_annotation)) {
+    old_ca <- cluster_annotation$Gene_ID
+    new_ca <- resolve_to_raw(old_ca)
+    n_ca_resolved <- sum(old_ca != new_ca)
+    if (n_ca_resolved > 0) {
+      cluster_annotation$Gene_ID <- new_ca
+      cat(sprintf("  ★ Cluster annotation IDs normalized: %d resolved\n", n_ca_resolved))
+    }
+  }
+}
 
 # ========================================================================
 # Part 0b: 颜色方案初始化
@@ -462,7 +745,7 @@ cat(sprintf("  Time colors: %s\n", paste(names(colors$time), colors$time, sep="=
 plot_results <- list()
 
 # ========================================================================
-# Part 1: 共享网络数据构建 (v4.4: 参数化 Degree + 截断重剪枝)
+# Part 1: 共享网络数据构建 (v4.5: 分级锚点 + 共享靶标)
 # ========================================================================
 
 need_network_data <- any(c("network", "evidence_heatmap") %in% PARAMS$plots_vec)
@@ -470,7 +753,7 @@ need_network_data <- any(c("network", "evidence_heatmap") %in% PARAMS$plots_vec)
 network_data <- NULL
 
 if (need_network_data) {
-  cat("\n--- Part 1: 构建共享网络数据 (v4.4: 参数化 Degree + 截断重剪枝) ---\n")
+  cat("\n--- Part 1: 构建共享网络数据 (v4.5: 分级锚点 + 共享靶标) ---\n")
 
   network_data <- tryCatch({
 
@@ -487,7 +770,7 @@ if (need_network_data) {
       stop("No edge table found in RData")
     }
 
-    # --- Step 1b: 定义锚定基因集 ---
+    # --- Step 1b: 定义分级锚点 (v4.5) ---
     anchor_focus_tfs <- if (exists("focus_tfs") && length(focus_tfs) > 0) {
       focus_tfs
     } else { character(0) }
@@ -496,19 +779,102 @@ if (need_network_data) {
       PARAMS$focus_gene
     } else { character(0) }
 
-    anchor_highlight <- if (!is.null(highlight_map) && length(highlight_map) > 0) {
-      names(highlight_map)
-    } else { character(0) }
+    # ★ v4.5: 按来源分级
+    if (!is.null(highlight_map) && length(highlight_map) > 0) {
+      hl_ids <- names(highlight_map)
+      
+      if (exists("highlight_source_map") && length(highlight_source_map) > 0) {
+        anchor_hl_primary   <- names(highlight_source_map[highlight_source_map == "primary"])
+        anchor_hl_secondary_raw <- names(highlight_source_map[highlight_source_map == "secondary"])
+      } else {
+        anchor_hl_primary   <- hl_ids
+        anchor_hl_secondary_raw <- character(0)
+      }
+    } else {
+      anchor_hl_primary <- character(0)
+      anchor_hl_secondary_raw <- character(0)
+    }
 
-    anchor_genes <- unique(c(anchor_focus_tfs, anchor_focus_gene, anchor_highlight))
+    anchor_primary <- unique(c(anchor_focus_tfs, anchor_focus_gene, anchor_hl_primary))
+
+    cat(sprintf("    Anchor primary: %d (Focus TFs=%d, Focus gene=%d, HL primary=%d)\n",
+                length(anchor_primary), length(anchor_focus_tfs),
+                length(anchor_focus_gene), length(anchor_hl_primary)))
+    cat(sprintf("    Anchor secondary (raw): %d\n", length(anchor_hl_secondary_raw)))
+
+    # =================================================================
+    # ★ Step 1b2: 二级锚点拓扑筛选 (v4.5 新增)
+    # =================================================================
+    anchor_secondary <- character(0)
+
+    if (length(anchor_hl_secondary_raw) > 0 && length(anchor_primary) > 0) {
+      max_sec_steps <- as.integer(PARAMS$network_max_secondary_steps)
+      
+      cat(sprintf("    ★ Step 1b2: Secondary anchor topological filtering (max_steps=%d)...\n",
+                  max_sec_steps))
+      
+      # 构建全基因组显著边无向图
+      sig_edges_full <- edge_source %>%
+        filter(
+          edge_class %in% c("Lost", "Gained", "Rewired", "Conserved"),
+          (sig_WT | sig_MUT)
+        ) %>%
+        select(TF_Gene, Target_Gene) %>%
+        distinct()
+      
+      g_full <- igraph::graph_from_data_frame(sig_edges_full, directed = FALSE)
+      
+      primary_in_graph <- intersect(anchor_primary, igraph::V(g_full)$name)
+      secondary_in_graph <- intersect(anchor_hl_secondary_raw, igraph::V(g_full)$name)
+      
+      if (length(primary_in_graph) > 0 && length(secondary_in_graph) > 0) {
+        dist_mat <- igraph::distances(
+          g_full,
+          v = secondary_in_graph,
+          to = primary_in_graph,
+          mode = "all"
+        )
+        min_dist <- apply(dist_mat, 1, min, na.rm = TRUE)
+        
+        anchor_secondary <- names(min_dist[is.finite(min_dist) & min_dist <= max_sec_steps])
+        
+        n_kept <- length(anchor_secondary)
+        n_dropped <- length(anchor_hl_secondary_raw) - n_kept
+        
+        cat(sprintf("       Secondary in graph: %d / %d\n",
+                    length(secondary_in_graph), length(anchor_hl_secondary_raw)))
+        cat(sprintf("       Kept: %d (within %d steps) | Dropped: %d\n",
+                    n_kept, max_sec_steps, n_dropped))
+        
+        if (length(min_dist[is.finite(min_dist)]) > 0) {
+          dist_tab <- table(pmin(min_dist[is.finite(min_dist)], max_sec_steps + 1))
+          cat("       Distance distribution:\n")
+          for (d in sort(as.integer(names(dist_tab)))) {
+            label <- if (d > max_sec_steps) paste0(">", max_sec_steps) else as.character(d)
+            cat(sprintf("         %s step(s): %d genes\n", label, dist_tab[as.character(d)]))
+          }
+        }
+      } else {
+        cat("       \u26A0 Insufficient overlap with full graph, no secondary anchors retained\n")
+      }
+      
+      rm(g_full, sig_edges_full)
+      
+    } else if (length(anchor_hl_secondary_raw) > 0) {
+      cat("    ★ Step 1b2: Skipped (no primary anchors to compute distances)\n")
+    } else {
+      cat("    ★ Step 1b2: Skipped (no secondary anchors)\n")
+    }
+
+    # 构建最终锚点集
+    anchor_genes <- unique(c(anchor_primary, anchor_secondary))
 
     if (length(anchor_genes) == 0) {
       stop("No anchor genes defined.")
     }
 
-    cat(sprintf("    Anchor genes: %d (Focus TFs=%d, Focus gene=%d, Highlight=%d)\n",
-                length(anchor_genes), length(anchor_focus_tfs),
-                length(anchor_focus_gene), length(anchor_highlight)))
+    cat(sprintf("    Final anchor set: %d (primary=%d, secondary=%d)\n",
+                length(anchor_genes), length(anchor_primary), length(anchor_secondary)))
 
     # --- Step 1c: 锚定边选取 ---
     net_edges <- edge_source %>%
@@ -530,6 +896,145 @@ if (need_network_data) {
                 raw_class_counts["Gained"] %||% 0,
                 raw_class_counts["Rewired"] %||% 0,
                 raw_class_counts["Conserved"] %||% 0))
+
+    # =================================================================
+    # ★ Step 1c2: 网络内边补全 (v4.5 新增, 默认执行)
+    # =================================================================
+    # 对 Step 1c 选出的所有节点, 检查它们之间在 edge_source 中
+    # 是否有未被选入的显著边。如有则补入。
+    # 不引入新节点, 仅补边。
+    # =================================================================
+
+    intra_edges_added <- 0L
+
+    if (isTRUE(PARAMS$network_intra_completion)) {
+      all_nodes_1c <- unique(c(net_edges$TF_Gene, net_edges$Target_Gene))
+      n_edges_before_intra <- nrow(net_edges)
+
+      intra_edges <- edge_source %>%
+        filter(
+          TF_Gene %in% all_nodes_1c & Target_Gene %in% all_nodes_1c,
+          edge_class %in% c("Lost", "Gained", "Rewired", "Conserved"),
+          (sig_WT | sig_MUT)
+        ) %>%
+        anti_join(net_edges, by = c("TF_Gene", "Target_Gene"))
+
+      if (nrow(intra_edges) > 0) {
+        net_edges <- bind_rows(net_edges, intra_edges)
+        intra_edges_added <- nrow(intra_edges)
+        cat(sprintf("    ★ Step 1c2 intra-completion: +%d edges (total: %d → %d)\n",
+                    nrow(intra_edges), n_edges_before_intra, nrow(net_edges)))
+      } else {
+        cat("    ★ Step 1c2 intra-completion: no additional edges found\n")
+      }
+    } else {
+      cat("    ★ Step 1c2 intra-completion: disabled (network_intra_completion=FALSE)\n")
+    }
+
+    # =================================================================
+    # ★ Step 1c3: 共享靶标发现 (v4.5 新增, 默认执行)
+    # =================================================================
+    # 对网络中每个 TF, 查找其与 focus_gene 在 edge_source 中的共享靶标。
+    # 目的: 捕获 TF 与 focus_gene 的共调控关系。
+    # =================================================================
+
+    shared_targets_added <- 0L
+    shared_edges_added   <- 0L
+
+    if (isTRUE(PARAMS$network_shared_targets) &&
+        !is.null(PARAMS$focus_gene) &&
+        PARAMS$focus_gene != "none" &&
+        !is.na(PARAMS$focus_gene)) {
+      
+      cat("    ★ Step 1c3: Shared target discovery...\n")
+      
+      focus_id <- PARAMS$focus_gene
+      current_nodes <- unique(c(net_edges$TF_Gene, net_edges$Target_Gene))
+      
+      network_tfs <- intersect(current_nodes, names(tf_family_map))
+      network_tfs <- setdiff(network_tfs, focus_id)
+      
+      focus_targets_df <- edge_source %>%
+        filter(
+          TF_Gene == focus_id,
+          edge_class %in% c("Lost", "Gained", "Rewired", "Conserved"),
+          (sig_WT | sig_MUT)
+        )
+      focus_target_ids <- unique(focus_targets_df$Target_Gene)
+      
+      if (length(network_tfs) > 0 && length(focus_target_ids) > 0) {
+        
+        tf_targets_df <- edge_source %>%
+          filter(
+            TF_Gene %in% network_tfs,
+            Target_Gene %in% focus_target_ids,
+            edge_class %in% c("Lost", "Gained", "Rewired", "Conserved"),
+            (sig_WT | sig_MUT)
+          )
+        
+        shared_targets_new <- setdiff(unique(tf_targets_df$Target_Gene), current_nodes)
+        
+        if (length(shared_targets_new) > 0) {
+          new_tf_edges <- tf_targets_df %>%
+            filter(Target_Gene %in% shared_targets_new)
+          
+          new_focus_edges <- focus_targets_df %>%
+            filter(Target_Gene %in% shared_targets_new)
+          
+          new_edges_all <- bind_rows(new_tf_edges, new_focus_edges) %>%
+            distinct(TF_Gene, Target_Gene, .keep_all = TRUE) %>%
+            anti_join(net_edges, by = c("TF_Gene", "Target_Gene"))
+          
+          if (nrow(new_edges_all) > 0) {
+            n_before <- nrow(net_edges)
+            net_edges <- bind_rows(net_edges, new_edges_all)
+            
+            actual_new_targets <- setdiff(
+              unique(c(new_edges_all$TF_Gene, new_edges_all$Target_Gene)),
+              current_nodes
+            )
+            
+            shared_targets_added <- length(actual_new_targets)
+            shared_edges_added   <- nrow(new_edges_all)
+            
+            cat(sprintf("       Shared targets found: %d (new to network)\n",
+                        length(actual_new_targets)))
+            cat(sprintf("       Edges added: +%d (total: %d → %d)\n",
+                        nrow(new_edges_all), n_before, nrow(net_edges)))
+            
+            shared_summary <- new_tf_edges %>%
+              filter(Target_Gene %in% shared_targets_new) %>%
+              count(TF_Gene, name = "n_shared") %>%
+              arrange(desc(n_shared))
+            
+            for (idx in seq_len(min(10, nrow(shared_summary)))) {
+              tf_id <- shared_summary$TF_Gene[idx]
+              tf_label <- if (tf_id %in% names(tf_family_map)) {
+                paste0(tf_id, " (", tf_family_map[tf_id], ")")
+              } else { tf_id }
+              cat(sprintf("         %s: %d shared targets\n",
+                          tf_label, shared_summary$n_shared[idx]))
+            }
+            if (nrow(shared_summary) > 10) {
+              cat(sprintf("         ... and %d more TFs\n", nrow(shared_summary) - 10))
+            }
+          } else {
+            cat("       No new edges to add (all shared targets already connected)\n")
+          }
+        } else {
+          cat("       No new shared targets found (all already in network)\n")
+        }
+      } else {
+        cat(sprintf("       Skipped: %d network TFs, %d focus targets\n",
+                    length(network_tfs), length(focus_target_ids)))
+      }
+    } else {
+      if (!isTRUE(PARAMS$network_shared_targets)) {
+        cat("    ★ Step 1c3: Shared target discovery disabled\n")
+      } else {
+        cat("    ★ Step 1c3: Skipped (no valid focus_gene)\n")
+      }
+    }
 
     # --- Step 1d: 智能剪枝 (v4.4: 参数化 degree 控制) ---
     if (PARAMS$network_prune) {
@@ -656,30 +1161,44 @@ if (need_network_data) {
       cat("    \u26A0 No valid focus_gene specified (='none'), ego filter skipped\n")
     }
 
-    # --- Step 1e: 安全截断 ---
+    # --- Step 1e: 安全截断 (v4.5: 分级) ---
     max_edges <- PARAMS$network_max_edges
 
     if (nrow(net_edges) > max_edges) {
       cat(sprintf("    Safety cap: %d edges > limit %d\n", nrow(net_edges), max_edges))
-
-      anchor_edge_mask <- (net_edges$TF_Gene %in% anchor_genes |
-                           net_edges$Target_Gene %in% anchor_genes)
-      anchor_edges_df <- net_edges[anchor_edge_mask, ]
-      other_edges_df  <- net_edges[!anchor_edge_mask, ]
-
-      if (nrow(anchor_edges_df) < max_edges) {
-        n_other_keep <- max_edges - nrow(anchor_edges_df)
-        other_edges_df <- other_edges_df %>%
-          arrange(desc(abs(MECS_score))) %>%
-          head(n_other_keep)
-        net_edges <- bind_rows(anchor_edges_df, other_edges_df)
+      
+      # 分级: 判断每条边的最高锚点级别
+      is_L1 <- (net_edges$TF_Gene %in% anchor_primary | 
+                 net_edges$Target_Gene %in% anchor_primary)
+      is_L2 <- (!is_L1) & 
+                (net_edges$TF_Gene %in% anchor_secondary | 
+                 net_edges$Target_Gene %in% anchor_secondary)
+      is_L3 <- (!is_L1) & (!is_L2)
+      
+      L1_edges <- net_edges[is_L1, ]
+      L2_edges <- net_edges[is_L2, ]
+      L3_edges <- net_edges[is_L3, ]
+      
+      cat(sprintf("       Level 1 (primary): %d | Level 2 (secondary): %d | Level 3 (other): %d\n",
+                  nrow(L1_edges), nrow(L2_edges), nrow(L3_edges)))
+      
+      if (nrow(L1_edges) >= max_edges) {
+        net_edges <- L1_edges %>% arrange(desc(abs(MECS_score))) %>% head(max_edges)
+        cat(sprintf("       L1 exceeds cap, truncated L1 to %d\n", nrow(net_edges)))
       } else {
-        net_edges <- anchor_edges_df %>%
-          arrange(desc(abs(MECS_score))) %>%
-          head(max_edges)
+        remaining <- max_edges - nrow(L1_edges)
+        
+        if (nrow(L2_edges) <= remaining) {
+          remaining2 <- remaining - nrow(L2_edges)
+          L3_keep <- L3_edges %>% arrange(desc(abs(MECS_score))) %>% head(remaining2)
+          net_edges <- bind_rows(L1_edges, L2_edges, L3_keep)
+        } else {
+          L2_keep <- L2_edges %>% arrange(desc(abs(MECS_score))) %>% head(remaining)
+          net_edges <- bind_rows(L1_edges, L2_keep)
+        }
+        
+        cat(sprintf("       Truncated to %d edges\n", nrow(net_edges)))
       }
-
-      cat(sprintf("       Truncated to %d edges\n", nrow(net_edges)))
     }
 
     # =================================================================
@@ -856,21 +1375,27 @@ if (need_network_data) {
                 sum(node_meta$NodeType == "Highlight"),
                 sum(node_meta$NodeType == "Target")))
 
-    # ★ v4.2: 将 ego 过滤信息附加到返回结构中
+    # ★ v4.5: 将分级锚点和补全信息附加到返回结构中
     list(
       net_edges           = net_edges,
       node_meta           = node_meta,
       anchor_genes        = anchor_genes,
+      anchor_primary      = anchor_primary,
+      anchor_secondary    = anchor_secondary,
       anchor_focus_tfs    = anchor_focus_tfs,
       anchor_focus_gene   = anchor_focus_gene,
-      anchor_highlight    = anchor_highlight,
       edge_source         = edge_source,
       tf_sym_map          = tf_sym_map,
       tg_sym_map          = tg_sym_map,
       highlight_symbols   = highlight_symbols,
       ego_filter_applied  = ego_filter_applied,
       ego_steps_used      = ego_steps,
-      ego_n_removed       = ego_n_removed
+      ego_n_removed       = ego_n_removed,
+      # v4.5 new fields
+      intra_edges_added   = intra_edges_added,
+      shared_targets_added = shared_targets_added,
+      shared_edges_added  = shared_edges_added,
+      anchor_hl_secondary_raw = if (exists("anchor_hl_secondary_raw")) anchor_hl_secondary_raw else character(0)
     )
   }, error = function(e) {
     cat(sprintf("    \u26A0 Network data construction failed: %s\n", e$message))
@@ -1153,11 +1678,11 @@ if ("barplot" %in% PARAMS$plots_vec) {
 }
 
 # ========================================================================
-# 图 4: Anchor-Based Directed Network (v4.4: 参数化 Degree)
+# 图 4: Anchor-Based Directed Network (v4.5: 分级锚点)
 # ========================================================================
 
 if ("network" %in% PARAMS$plots_vec) {
-  cat("\n--- 图 4: Anchor-Based Directed Network (v4.4) ---\n")
+  cat("\n--- 图 4: Anchor-Based Directed Network (v4.5) ---\n")
 
   plot_results[["network"]] <- tryCatch({
 
@@ -1300,9 +1825,13 @@ if ("network" %in% PARAMS$plots_vec) {
           pruned_class_counts["Gained"] %||% 0,
           pruned_class_counts["Rewired"] %||% 0,
           pruned_class_counts["Conserved"] %||% 0),
-        caption = sprintf("Pruning: Conserved excl. from degree | deg1_all=%s, deg1_focus=%s | %s | Layout: %s | Seed: %d",
-          PARAMS$network_keep_deg1_all, PARAMS$network_keep_deg1_focus,
-          ego_note, layout_algo, PARAMS$network_seed)
+        caption = sprintf(
+          "v4.7 | Primary:%d Secondary:%d | Intra:%s | SharedTgt:+%d nodes | Cap:L1>L2>L3 | %s | Seed:%d",
+          length(network_data$anchor_primary), length(network_data$anchor_secondary),
+          ifelse(isTRUE(PARAMS$network_intra_completion),
+                 sprintf("+%d edges", network_data$intra_edges_added), "OFF"),
+          network_data$shared_targets_added,
+          ego_note, PARAMS$network_seed)
       )
 
     fig_w <- PARAMS$network_fig_w
@@ -1313,16 +1842,17 @@ if ("network" %in% PARAMS$plots_vec) {
               fig_format = PARAMS$fig_format, dpi = PARAMS$fig_dpi,
               scale = PARAMS$fig_scale)
 
-    # --- Cytoscape CSV 导出 ---
+    # --- Cytoscape CSV 导出 (★ v4.7: Node_ID 和 edge 端点使用 stripped 格式) ---
     cat("    Exporting Cytoscape-compatible CSVs...\n")
 
     cyto_nodes <- as_tibble(g, what = "nodes") %>%
       mutate(
+        Node_ID = shorten_id(id),
         Display_Label = case_when(!is.na(Symbol) & Symbol != "" ~ Symbol,
                                   TRUE ~ shorten_id(id)),
         Cluster_Label = ifelse(!is.na(WT_Cluster), paste0("C", WT_Cluster), "NA")
       ) %>%
-      select(Node_ID = id, Display_Label, NodeType, Family,
+      select(Node_ID, Display_Label, NodeType, Family,
              Is_Focus_TF, Is_TF, Is_Highlight, Is_Focus_Gene, Is_Anchor,
              Cluster_Label, Degree = degree)
 
@@ -1331,7 +1861,8 @@ if ("network" %in% PARAMS$plots_vec) {
               row.names = FALSE)
 
     cyto_edges <- edge_data %>%
-      select(Source = from, Target = to, Edge_Class = edge_class,
+      mutate(Source = shorten_id(from), Target = shorten_id(to)) %>%
+      select(Source, Target, Edge_Class = edge_class,
              Delta_r = delta_r, Weight = edge_width)
     if ("MECS_score" %in% colnames(edge_data)) cyto_edges$MECS_Score <- edge_data$MECS_score
     if ("Tier" %in% colnames(edge_data)) cyto_edges$Tier <- edge_data$Tier
@@ -1343,19 +1874,34 @@ if ("network" %in% PARAMS$plots_vec) {
     cat(sprintf("    Cytoscape export: %d nodes, %d edges\n",
                 nrow(cyto_nodes), nrow(cyto_edges)))
 
-    # --- Network Summary JSON (★ v4.2: 含 ego 信息) ---
+    # --- Network Summary JSON (★ v4.5: 含分级锚点 + 补全信息) ---
     network_summary <- list(
+      version = "v4.5",
       n_anchor_genes = length(anchor_genes),
       n_final_nodes = final_n, n_final_edges = final_e,
       edge_class_counts = as.list(pruned_class_counts),
       node_type_counts = as.list(table(node_meta$NodeType)),
-      pruning_note = sprintf("v4.4: keep_deg1_all=%s, keep_deg1_focus=%s",
+      pruning_note = sprintf("v4.5: keep_deg1_all=%s, keep_deg1_focus=%s",
                             PARAMS$network_keep_deg1_all, PARAMS$network_keep_deg1_focus),
       ego_filter = list(
         applied       = network_data$ego_filter_applied,
         ego_steps     = network_data$ego_steps_used,
         nodes_removed = network_data$ego_n_removed,
         focus_gene    = PARAMS$focus_gene
+      ),
+      secondary_anchors = list(
+        raw_count      = length(network_data$anchor_hl_secondary_raw),
+        filtered_count = length(network_data$anchor_secondary),
+        max_steps      = PARAMS$network_max_secondary_steps
+      ),
+      intra_completion = list(
+        enabled     = isTRUE(PARAMS$network_intra_completion),
+        edges_added = network_data$intra_edges_added
+      ),
+      shared_targets = list(
+        enabled        = isTRUE(PARAMS$network_shared_targets),
+        targets_added  = network_data$shared_targets_added,
+        edges_added    = network_data$shared_edges_added
       ),
       layout = layout_algo, fig_size = c(fig_w, fig_h)
     )
@@ -1575,7 +2121,7 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
     time_display_map <- setNames(gsub("^0", "", non_ctrl_times), non_ctrl_times)
 
     # ===================================================================
-    # Step 7d: 基因池构建
+    # Step 7d: 基因池构建 (★ v4.7: ID 格式兼容)
     # ===================================================================
 
     nd <- network_data
@@ -1589,8 +2135,51 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
       pull(id)
 
     first_comp_genes <- rownames(as.data.frame(all_comps[[1]]))
-    target_genes_pool <- intersect(target_genes_pool, first_comp_genes)
-    tf_genes_pool     <- intersect(tf_genes_pool, first_comp_genes)
+
+    # ★ v4.7: 智能匹配 — 如果直接 intersect 产出太少, 尝试 stripped 匹配
+    target_direct <- intersect(target_genes_pool, first_comp_genes)
+    tf_direct     <- intersect(tf_genes_pool, first_comp_genes)
+
+    if ((length(target_direct) < length(target_genes_pool) * 0.3 ||
+         length(tf_direct) < length(tf_genes_pool) * 0.3) &&
+        nzchar(.gene_id_strip_pattern)) {
+      cat("    ★ DESeq2 ID format mismatch detected, trying stripped matching...\n")
+      # DESeq2 可能用 stripped ID; node_meta 用 raw ID
+      # 建立 stripped(deseq2) → raw(node_meta) 映射
+      deseq2_stripped <- standardize_ids(first_comp_genes, .gene_id_strip_pattern)
+      node_stripped   <- standardize_ids(c(target_genes_pool, tf_genes_pool), .gene_id_strip_pattern)
+      
+      # 如果 DESeq2 ID 本身就是 stripped 格式, stripped 后不变
+      deseq2_is_stripped <- all(first_comp_genes == deseq2_stripped)
+      
+      if (deseq2_is_stripped) {
+        # DESeq2 用 stripped, node_meta 用 raw → 用 stripped 做 key
+        deseq2_map <- setNames(first_comp_genes, first_comp_genes)
+        target_stripped <- standardize_ids(target_genes_pool, .gene_id_strip_pattern)
+        tf_stripped     <- standardize_ids(tf_genes_pool, .gene_id_strip_pattern)
+        
+        target_genes_pool <- target_genes_pool[target_stripped %in% first_comp_genes]
+        tf_genes_pool     <- tf_genes_pool[tf_stripped %in% first_comp_genes]
+        
+        # 需要一个 raw→deseq2(stripped) 映射给后面的矩阵
+        .deseq2_id_map <<- setNames(target_stripped[target_stripped %in% first_comp_genes],
+                                     target_genes_pool)
+        .deseq2_id_map <<- c(.deseq2_id_map,
+                              setNames(tf_stripped[tf_stripped %in% first_comp_genes],
+                                       tf_genes_pool))
+        cat(sprintf("    ★ Re-matched via stripped IDs: %d targets, %d TFs\n",
+                    length(target_genes_pool), length(tf_genes_pool)))
+      } else {
+        # 两者都不是 stripped, 使用直接匹配结果
+        target_genes_pool <- target_direct
+        tf_genes_pool     <- tf_direct
+        .deseq2_id_map <<- NULL
+      }
+    } else {
+      target_genes_pool <- target_direct
+      tf_genes_pool     <- tf_direct
+      .deseq2_id_map <<- NULL
+    }
 
     cat(sprintf("    Gene pools (DESeq2-matched): %d targets, %d TFs\n",
                 length(target_genes_pool), length(tf_genes_pool)))
@@ -1621,6 +2210,15 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
       box_mat  <- matrix(FALSE,        nrow = n_genes, ncol = n_cols,
                          dimnames = list(gene_ids, col_names))
 
+      # ★ v4.7: 如果 ID 格式不同, 使用映射表将 gene_ids(raw) → DESeq2 ID(stripped)
+      use_id_map <- !is.null(.deseq2_id_map) && length(.deseq2_id_map) > 0
+      if (use_id_map) {
+        deseq2_ids <- ifelse(gene_ids %in% names(.deseq2_id_map),
+                             .deseq2_id_map[gene_ids], gene_ids)
+      } else {
+        deseq2_ids <- gene_ids
+      }
+
       for (tp in non_ctrl_times) {
 
         col_wt  <- paste0(cond_wt, "_", tp)
@@ -1630,10 +2228,18 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
         key_wt <- paste0("Time_", cond_wt, "_", tp, "_vs_", ctrl_time)
         if (key_wt %in% names(all_comps)) {
           res_wt <- as.data.frame(all_comps[[key_wt]])
-          matched <- intersect(gene_ids, rownames(res_wt))
-          lfc_mat[matched, col_wt] <- res_wt[matched, "log2FoldChange"]
-          padj_vec <- res_wt[matched, "padj"]
-          star_mat[matched, col_wt] <- ifelse(
+          matched_deseq2 <- intersect(deseq2_ids, rownames(res_wt))
+          # 映射回 gene_ids 空间用于矩阵索引
+          if (use_id_map) {
+            matched_raw <- gene_ids[deseq2_ids %in% matched_deseq2]
+            matched_d   <- deseq2_ids[deseq2_ids %in% matched_deseq2]
+          } else {
+            matched_raw <- matched_deseq2
+            matched_d   <- matched_deseq2
+          }
+          lfc_mat[matched_raw, col_wt] <- res_wt[matched_d, "log2FoldChange"]
+          padj_vec <- res_wt[matched_d, "padj"]
+          star_mat[matched_raw, col_wt] <- ifelse(
             is.na(padj_vec), "",
             ifelse(padj_vec < 0.01, "**",
                    ifelse(padj_vec < 0.05, "*", ""))
@@ -1646,10 +2252,17 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
         key_mut <- paste0("Time_", cond_mut, "_", tp, "_vs_", ctrl_time)
         if (key_mut %in% names(all_comps)) {
           res_mut <- as.data.frame(all_comps[[key_mut]])
-          matched <- intersect(gene_ids, rownames(res_mut))
-          lfc_mat[matched, col_mut] <- res_mut[matched, "log2FoldChange"]
-          padj_vec <- res_mut[matched, "padj"]
-          star_mat[matched, col_mut] <- ifelse(
+          matched_deseq2 <- intersect(deseq2_ids, rownames(res_mut))
+          if (use_id_map) {
+            matched_raw <- gene_ids[deseq2_ids %in% matched_deseq2]
+            matched_d   <- deseq2_ids[deseq2_ids %in% matched_deseq2]
+          } else {
+            matched_raw <- matched_deseq2
+            matched_d   <- matched_deseq2
+          }
+          lfc_mat[matched_raw, col_mut] <- res_mut[matched_d, "log2FoldChange"]
+          padj_vec <- res_mut[matched_d, "padj"]
+          star_mat[matched_raw, col_mut] <- ifelse(
             is.na(padj_vec), "",
             ifelse(padj_vec < 0.01, "**",
                    ifelse(padj_vec < 0.05, "*", ""))
@@ -1662,12 +2275,19 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
         key_geno <- paste0("Genotype_", cond_mut, "_vs_", cond_wt, "_at_", tp)
         if (key_geno %in% names(all_comps)) {
           res_geno <- as.data.frame(all_comps[[key_geno]])
-          matched <- intersect(gene_ids, rownames(res_geno))
-          padj_geno <- res_geno[matched, "padj"]
-          lfc_geno  <- res_geno[matched, "log2FoldChange"]
+          matched_deseq2 <- intersect(deseq2_ids, rownames(res_geno))
+          if (use_id_map) {
+            matched_raw <- gene_ids[deseq2_ids %in% matched_deseq2]
+            matched_d   <- deseq2_ids[deseq2_ids %in% matched_deseq2]
+          } else {
+            matched_raw <- matched_deseq2
+            matched_d   <- matched_deseq2
+          }
+          padj_geno <- res_geno[matched_d, "padj"]
+          lfc_geno  <- res_geno[matched_d, "log2FoldChange"]
 
-          for (k in seq_along(matched)) {
-            g <- matched[k]
+          for (k in seq_along(matched_raw)) {
+            g <- matched_raw[k]
             p_val   <- padj_geno[k]
             lfc_val <- lfc_geno[k]
 
@@ -2040,7 +2660,7 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
 
     target_export <- cbind(
       data.frame(
-        Gene_ID         = target_meta$id,
+        Gene_ID         = shorten_id(target_meta$id),
         Symbol          = target_meta$Symbol,
         WT_Cluster      = target_meta$WT_Cluster_label,
         Edge_Dominant   = target_meta$Edge_Dominant,
@@ -2055,7 +2675,7 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
 
     tf_export <- cbind(
       data.frame(
-        Gene_ID      = tf_meta$id,
+        Gene_ID      = shorten_id(tf_meta$id),
         Symbol       = tf_meta$Symbol,
         Family       = tf_meta$Family,
         Is_Focus_TF  = tf_meta$Is_Focus_TF,
@@ -2070,12 +2690,13 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
 
     # ★ v4.2: Summary JSON 含 ego 过滤信息
     fig7_summary <- list(
-      version           = "v4.4",
+      version           = "v4.5",
       changes           = list(
         "v4.1: directional boxes, Fig7a/7b layout",
         "v4.2: ego-network topological constraint applied before visualization",
         "v4.3: post-cap connectivity re-check; network_max_nodes → network_max_edges",
-        "v4.4: parameterized degree-1 control; post-cap degree re-pruning"
+        "v4.4: parameterized degree-1 control; post-cap degree re-pruning",
+        "v4.5: graded anchors (primary/secondary), intra-completion, shared target discovery"
       ),
       ego_filter = list(
         applied       = network_data$ego_filter_applied,
@@ -2122,7 +2743,7 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
 # ========================================================================
 
 cat("\n================================================================================\n")
-cat("  Pipeline 7c: Visualization Complete (v4.4)\n")
+cat("  Pipeline 7c: Visualization Complete (v4.7)\n")
 cat("================================================================================\n\n")
 
 cat(sprintf("结束时间: %s\n\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))

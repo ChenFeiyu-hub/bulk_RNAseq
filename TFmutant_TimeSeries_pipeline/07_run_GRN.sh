@@ -25,6 +25,7 @@ fi
 RUN_7A="FALSE"
 RUN_7B="FALSE"
 RUN_7C="FALSE"
+RUN_7C_NET="FALSE"    # v4.5: 只执行 7c 中的 Fig4 网络图
 STEP_SPECIFIED="FALSE"
 
 # ========================================================
@@ -71,6 +72,9 @@ FOCUS_TF_FAMILY="${GRN_FOCUS_TF_FAMILY:-none}"
 FOCUS_GENE="${GRN_FOCUS_GENE:-none}"
 CLUSTER_PAIRS_FILE="${GRN_CLUSTER_PAIRS_FILE:-}"
 PCRE_TF_MAP="${GRN_PCRE_TF_MAP:-}"
+PCRE_INTEGRATED_DIR="${GRN_PCRE_INTEGRATED_DIR:-${BASE_DIR}/06_pCRE/Pipeline6c_v3.0_MotifIntegration}"
+PCRE_FAMILY_ALIAS="${GRN_PCRE_FAMILY_ALIAS:-}"
+PCRE_MIN_PCC="${GRN_PCRE_MIN_PCC:-0}"
 BACKGROUND_MODE="${GRN_BACKGROUND_MODE:-mfuzz}"
 ENRICHMENT_METHOD="${GRN_ENRICHMENT_METHOD:-fisher}"
 MIN_EDGES="${GRN_MIN_EDGES:-5}"
@@ -113,9 +117,16 @@ CLUSTER_COLORS_FILE="${GRN_CLUSTER_COLORS_FILE:-}"
 EDGE_CLASS_COLORS_FILE="${GRN_EDGE_CLASS_COLORS_FILE:-}"
 
 AUTO_HL_CLUSTERS="${GRN_AUTO_HIGHLIGHT_CLUSTERS:-}"
-AUTO_HL_HUB_N="${GRN_AUTO_HIGHLIGHT_HUB_N:-30}"
+# v4.6: MECS quality filter parameters (replaces AUTO_HL_HUB_N)
+AUTO_HL_MIN_TIER="${GRN_AUTO_HIGHLIGHT_MIN_TIER:-3}"
+AUTO_HL_MIN_EDGE_COUNT="${GRN_AUTO_HIGHLIGHT_MIN_EDGE_COUNT:-1}"
 
 CLI_EGO_STEPS=""
+
+# v4.5: 分级锚点 + 共享靶标
+NETWORK_MAX_SECONDARY_STEPS="${GRN_NETWORK_MAX_SECONDARY_STEPS:-2}"
+NETWORK_INTRA_COMPLETION="${GRN_NETWORK_INTRA_COMPLETION:-FALSE}"
+NETWORK_SHARED_TARGETS="${GRN_NETWORK_SHARED_TARGETS:-TRUE}"
 
 # ========================================================
 # 5. 帮助信息
@@ -132,6 +143,7 @@ usage() {
     echo "  -a, --step-a          Run Pipeline 7a only"
     echo "  -b, --step-b          Run Pipeline 7b only"
     echo "  -c, --step-c          Run Pipeline 7c only"
+    echo "  -n, --step-net        Run Pipeline 7c network plot (Fig4) only"
     echo "  (可组合使用, 如: -a -b 仅执行 7a 和 7b)"
     echo ""
     echo "Global Options:"
@@ -157,7 +169,10 @@ usage() {
     echo "  --focus_tf_family N   TF family to focus (default: ${FOCUS_TF_FAMILY})"
     echo "  --focus_gene ID       Gene ID to focus (default: ${FOCUS_GENE})"
     echo "  --cluster_pairs PATH  Cluster pair definition TSV"
-    echo "  --pcre_tf_map PATH    pCRE-TF family mapping TSV"
+    echo "  --pcre_tf_map PATH    pCRE-TF family mapping TSV (manual, highest priority)"
+    echo "  --pcre_integrated_dir PATH  Pipeline 6c output dir for auto pCRE parsing"
+    echo "  --pcre_family_alias STR     Manual alias e.g. 'C2C2dof=DOF,C2C2gata=GATA'"
+    echo "  --pcre_min_pcc N      Min PCC for pCRE DB match (default: ${PCRE_MIN_PCC})"
     echo "  --background_mode M   mfuzz/all_deg/genome (default: ${BACKGROUND_MODE})"
     echo "  --enrichment_method M fisher/hypergeometric (default: ${ENRICHMENT_METHOD})"
     echo "  --min_edges N         Minimum edges for enrichment (default: ${MIN_EDGES})"
@@ -189,6 +204,10 @@ usage() {
     echo "  --network_node_size_min N   Min node size (default: ${NETWORK_NODE_SIZE_MIN})"
     echo "  --network_node_size_max N   Max node size (default: ${NETWORK_NODE_SIZE_MAX})"
     echo "  --network_ego_steps N Ego-network topology steps (default: auto)"
+    echo "  --network_max_secondary_steps N  Max topological distance for secondary anchors (default: 2)"
+    echo "  --network_intra_completion BOOL  Enable intra-network edge completion (default: FALSE)"
+    echo "  --network_shared_targets BOOL   Enable shared target discovery (default: TRUE)"
+    echo "  --gene_id_strip REGEX  Gene ID cleanup regex (default: from config GENE_ID_STRIP_PATTERN)"
     echo "  --circos_max_edges N  Max edges in circos (default: ${CIRCOS_MAX_EDGES})"
     echo "  --circos_top_edges N  Top edges in circos (default: ${CIRCOS_TOP_EDGES})"
     echo "  --deseq2_rdata PATH   DESeq2 RData for evidence heatmap"
@@ -209,6 +228,7 @@ while [[ $# -gt 0 ]]; do
         -a|--step-a)          RUN_7A="TRUE"; STEP_SPECIFIED="TRUE"; shift ;;
         -b|--step-b)          RUN_7B="TRUE"; STEP_SPECIFIED="TRUE"; shift ;;
         -c|--step-c)          RUN_7C="TRUE"; STEP_SPECIFIED="TRUE"; shift ;;
+        -n|--step-net)        RUN_7C_NET="TRUE"; STEP_SPECIFIED="TRUE"; shift ;;
         
         # === 全局参数 ===
         --out_dir)            OUT_DIR="$2";              shift 2 ;;
@@ -234,6 +254,9 @@ while [[ $# -gt 0 ]]; do
         --focus_gene)         FOCUS_GENE="$2";           shift 2 ;;
         --cluster_pairs)      CLUSTER_PAIRS_FILE="$2";   shift 2 ;;
         --pcre_tf_map)        PCRE_TF_MAP="$2";          shift 2 ;;
+        --pcre_integrated_dir) PCRE_INTEGRATED_DIR="$2"; shift 2 ;;
+        --pcre_family_alias)  PCRE_FAMILY_ALIAS="$2";    shift 2 ;;
+        --pcre_min_pcc)       PCRE_MIN_PCC="$2";         shift 2 ;;
         --background_mode)    BACKGROUND_MODE="$2";      shift 2 ;;
         --enrichment_method)  ENRICHMENT_METHOD="$2";    shift 2 ;;
         --min_edges)          MIN_EDGES="$2";            shift 2 ;;
@@ -265,6 +288,10 @@ while [[ $# -gt 0 ]]; do
         --network_node_size_min)  NETWORK_NODE_SIZE_MIN="$2";  shift 2 ;;
         --network_node_size_max)  NETWORK_NODE_SIZE_MAX="$2";  shift 2 ;;
         --network_ego_steps)  CLI_EGO_STEPS="$2";        shift 2 ;;
+        --network_max_secondary_steps) NETWORK_MAX_SECONDARY_STEPS="$2"; shift 2 ;;
+        --network_intra_completion) NETWORK_INTRA_COMPLETION="$2"; shift 2 ;;
+        --network_shared_targets) NETWORK_SHARED_TARGETS="$2"; shift 2 ;;
+        --gene_id_strip)          GENE_ID_STRIP_PATTERN="$2"; shift 2 ;;
         --circos_max_edges)   CIRCOS_MAX_EDGES="$2";     shift 2 ;;
         --circos_top_edges)   CIRCOS_TOP_EDGES="$2";     shift 2 ;;
         --deseq2_rdata)       DESEQ2_RDATA="$2";         shift 2 ;;
@@ -282,6 +309,12 @@ if [ "${STEP_SPECIFIED}" == "FALSE" ]; then
     RUN_7A="TRUE"
     RUN_7B="TRUE"
     RUN_7C="TRUE"
+fi
+
+# v4.5: -n 等价于 -c + network_only
+if [ "${RUN_7C_NET}" == "TRUE" ]; then
+    RUN_7C="TRUE"
+    PLOTS="network"
 fi
 
 # ========================================================
@@ -339,13 +372,34 @@ if [ -n "${CLUSTER_PAIRS_FILE}" ] && [ ! -f "${CLUSTER_PAIRS_FILE}" ]; then
     CLUSTER_PAIRS_FILE=""
 fi
 
-# pCRE-TF map 检查 (7b 可选)
+# pCRE-TF map 检查 (7b 可选, 三级优先级)
 USE_PCRE="FALSE"
+PCRE_SOURCE="none"
 if [ -n "${PCRE_TF_MAP}" ] && [ -f "${PCRE_TF_MAP}" ]; then
     USE_PCRE="TRUE"
+    PCRE_SOURCE="manual"
 elif [ -n "${PCRE_TF_MAP}" ] && [ ! -f "${PCRE_TF_MAP}" ]; then
     echo "⚠  Warning: pCRE-TF map not found: ${PCRE_TF_MAP}"
     PCRE_TF_MAP=""
+fi
+
+# 优先级 2: 6c 自动解析 (仅当无手动 map 时生效)
+USE_PCRE_AUTO="FALSE"
+if [ "${USE_PCRE}" == "FALSE" ] && [ -n "${PCRE_INTEGRATED_DIR}" ]; then
+    if [ -d "${PCRE_INTEGRATED_DIR}" ]; then
+        # 检查 WT 子目录下是否有整合表
+        if [ -f "${PCRE_INTEGRATED_DIR}/WT/Integrated_Features_Full.txt" ] || \
+           [ -f "${PCRE_INTEGRATED_DIR}/Integrated_Features_Full.txt" ]; then
+            USE_PCRE_AUTO="TRUE"
+            PCRE_SOURCE="auto_6c"
+            echo "ℹ  pCRE auto-parse: will use Pipeline 6c from ${PCRE_INTEGRATED_DIR}"
+        else
+            echo "⚠  Warning: Pipeline 6c dir exists but no Integrated_Features_Full.txt found"
+        fi
+    else
+        echo "⚠  Warning: Pipeline 6c dir not found: ${PCRE_INTEGRATED_DIR}"
+        PCRE_INTEGRATED_DIR=""
+    fi
 fi
 
 if [ ${ERRORS} -ne 0 ]; then
@@ -374,7 +428,8 @@ echo ""
 echo " Execution Plan:"
 [ "${RUN_7A}" == "TRUE" ] && echo "   ✓ Step A: Differential Co-expression Analysis"
 [ "${RUN_7B}" == "TRUE" ] && echo "   ✓ Step B: Cluster-Constrained Discovery + MECS"
-[ "${RUN_7C}" == "TRUE" ] && echo "   ✓ Step C: Network Visualization"
+[ "${RUN_7C}" == "TRUE" ] && [ "${RUN_7C_NET}" == "TRUE" ] && echo "   ✓ Step C: Network Visualization (Fig4 only)"
+[ "${RUN_7C}" == "TRUE" ] && [ "${RUN_7C_NET}" != "TRUE" ] && echo "   ✓ Step C: Network Visualization"
 echo ""
 echo " Output Directory: ${OUT_DIR}"
 echo ""
@@ -459,7 +514,14 @@ if [ "${RUN_7B}" == "TRUE" ]; then
     echo " Input:"
     echo "   7a RData:      ${RDATA_7A}"
     [ -n "${CLUSTER_PAIRS_FILE}" ] && echo "   Cluster Pairs: ${CLUSTER_PAIRS_FILE}" || echo "   Cluster Pairs: (auto-infer from P5)"
-    [ "${USE_PCRE}" == "TRUE" ] && echo "   pCRE-TF Map:   ${PCRE_TF_MAP}" || echo "   pCRE-TF Map:   (not used, MECS = S1+S2)"
+    if [ "${USE_PCRE}" == "TRUE" ]; then
+        echo "   pCRE-TF Map:   ${PCRE_TF_MAP} (manual)"
+    elif [ "${USE_PCRE_AUTO}" == "TRUE" ]; then
+        echo "   pCRE Source:    ${PCRE_INTEGRATED_DIR} (auto 6c)"
+        [ -n "${PCRE_FAMILY_ALIAS}" ] && echo "   pCRE Alias:     ${PCRE_FAMILY_ALIAS}"
+    else
+        echo "   pCRE-TF Map:   (not used, MECS = S1+S2)"
+    fi
     echo ""
     echo " Focus Configuration:"
     echo "   TF Family:  ${FOCUS_TF_FAMILY}"
@@ -489,6 +551,9 @@ if [ "${RUN_7B}" == "TRUE" ]; then
 
     [ -n "${CLUSTER_PAIRS_FILE}" ] && [ -f "${CLUSTER_PAIRS_FILE}" ] && ARGS_7B+=("--cluster_pairs" "${CLUSTER_PAIRS_FILE}")
     [ -n "${PCRE_TF_MAP}" ] && [ -f "${PCRE_TF_MAP}" ] && ARGS_7B+=("--pcre_tf_map" "${PCRE_TF_MAP}")
+    [ "${USE_PCRE_AUTO}" == "TRUE" ] && [ -n "${PCRE_INTEGRATED_DIR}" ] && ARGS_7B+=("--pcre_integrated_dir" "${PCRE_INTEGRATED_DIR}")
+    [ -n "${PCRE_FAMILY_ALIAS}" ] && ARGS_7B+=("--pcre_family_alias" "${PCRE_FAMILY_ALIAS}")
+    [ "${PCRE_MIN_PCC}" != "0" ] && ARGS_7B+=("--pcre_min_pcc" "${PCRE_MIN_PCC}")
     [ -n "${HIGHLIGHT_FILE}" ] && [ -f "${HIGHLIGHT_FILE}" ] && ARGS_7B+=("--highlight_file" "${HIGHLIGHT_FILE}")
 
     Rscript "${SCRIPT_DIR}/RNAseq_pipeline7b_discovery.R" "${ARGS_7B[@]}"
@@ -517,7 +582,7 @@ fi
 # ========================================================
 if [ "${RUN_7C}" == "TRUE" ]; then
     echo "================================================="
-    echo " [Step C] Network Visualization (v4.4)"
+    echo " [Step C] Network Visualization (v4.6)"
     echo "================================================="
     echo ""
 
@@ -534,35 +599,23 @@ if [ "${RUN_7C}" == "TRUE" ]; then
         fi
     fi
 
-    # === Auto-generate highlight if needed ===
+    # === v4.5: Highlight 来源解析 ===
+    HAS_USER_HIGHLIGHT="FALSE"
+    HAS_AUTO_HIGHLIGHT="FALSE"
     AUTO_HL_OUTPUT="${OUT_DIR}/Pipeline7c/auto_highlight.txt"
-    NEED_AUTO_HIGHLIGHT="FALSE"
     EFFECTIVE_HIGHLIGHT=""
 
+    # 检查用户提供的 highlight
     if [ -n "${GRN_HIGHLIGHT}" ] && [ -f "${GRN_HIGHLIGHT}" ]; then
-        echo " Highlight file: ${GRN_HIGHLIGHT} (user-provided)"
-        EFFECTIVE_HIGHLIGHT="${GRN_HIGHLIGHT}"
-    elif [ -n "${AUTO_HL_CLUSTERS}" ] && [ "${AUTO_HL_CLUSTERS}" != "none" ]; then
-        NEED_AUTO_HIGHLIGHT="TRUE"
-        echo " No highlight file → auto-generating from clusters: ${AUTO_HL_CLUSTERS}"
-    else
-        echo " ⚠ No highlight file and no clusters specified."
+        HAS_USER_HIGHLIGHT="TRUE"
+        echo " User highlight file: ${GRN_HIGHLIGHT}"
     fi
 
-    # === Ego-steps 智能分配 ===
-    if [ -n "${CLI_EGO_STEPS}" ]; then
-        NETWORK_EGO_STEPS="${CLI_EGO_STEPS}"
-        echo " ★ Ego-steps explicitly set via CLI: ${NETWORK_EGO_STEPS}"
-    elif [ "${NEED_AUTO_HIGHLIGHT}" == "TRUE" ]; then
-        NETWORK_EGO_STEPS="${GRN_NETWORK_EGO_STEPS:-2}"
-        echo " ★ Auto-mode: using Config/Default NETWORK_EGO_STEPS=${NETWORK_EGO_STEPS}"
-    else
-        NETWORK_EGO_STEPS="0"
-        echo " ★ User-list mode: forcing NETWORK_EGO_STEPS=0"
-    fi
-
-    # === Auto-highlight 生成 ===
-    if [ "${NEED_AUTO_HIGHLIGHT}" == "TRUE" ]; then
+    # 检查是否需要 cluster auto-highlight (独立于用户 highlight)
+    if [ -n "${AUTO_HL_CLUSTERS}" ] && [ "${AUTO_HL_CLUSTERS}" != "none" ]; then
+        echo " Auto-highlight clusters: ${AUTO_HL_CLUSTERS}"
+        
+        # --- 运行 7d 生成 auto-highlight ---
         echo ""
         echo " --- Auto-generating highlight from clusters ---"
         
@@ -573,8 +626,9 @@ if [ "${RUN_7C}" == "TRUE" ]; then
             "--clusters"              "${AUTO_HL_CLUSTERS}"
             "--membership_threshold"  "${MFUZZ_MEMBERSHIP_CUTOFF:-0.5}"
             "--max_genes_per_cluster" "${GRN_AUTO_HIGHLIGHT_MAX_PER_CLUSTER:-100}"
-            "--hub_top_n"             "${AUTO_HL_HUB_N}"
             "--tier_filter"           "1,2"
+            "--min_tier"              "${AUTO_HL_MIN_TIER}"
+            "--min_edge_count"        "${AUTO_HL_MIN_EDGE_COUNT}"
             "--output"                "${AUTO_HL_OUTPUT}"
         )
         
@@ -590,11 +644,61 @@ if [ "${RUN_7C}" == "TRUE" ]; then
         if [ $? -eq 0 ] && [ -f "${AUTO_HL_OUTPUT}" ]; then
             N_GENES=$(wc -l < "${AUTO_HL_OUTPUT}")
             echo " ✔ Auto-highlight generated: ${N_GENES} genes"
-            EFFECTIVE_HIGHLIGHT="${AUTO_HL_OUTPUT}"
+            HAS_AUTO_HIGHLIGHT="TRUE"
         else
-            echo " ⚠ Auto-highlight generation failed, proceeding without."
+            echo " ⚠ Auto-highlight generation failed."
         fi
     fi
+
+    # === v4.5: 合并逻辑 ===
+    if [ "${HAS_USER_HIGHLIGHT}" == "TRUE" ] && [ "${HAS_AUTO_HIGHLIGHT}" == "TRUE" ]; then
+        # 两者共存: 合并并标记来源
+        echo " Merging user highlight (primary) + cluster highlight (secondary)..."
+        MERGED="${OUT_DIR}/Pipeline7c/merged_highlight.txt"
+        
+        # v4.6 fix: 跳过用户文件表头行 (NR>1), 避免 "Symbol\tGene\tprimary" 污染合并文件
+        # 先写入标准表头
+        echo -e "Symbol\tGene\tSource" > "${MERGED}"
+        awk -F'\t' 'NR>1{print $1"\t"$2"\tprimary"}' "${GRN_HIGHLIGHT}" >> "${MERGED}"
+        awk -F'\t' 'NR>1{print $2}' "${GRN_HIGHLIGHT}" | sort -u > "${MERGED}.user_ids"
+        grep -v -F -f "${MERGED}.user_ids" <(awk -F'\t' '{print $1"\t"$2"\tsecondary"}' "${AUTO_HL_OUTPUT}") >> "${MERGED}" 2>/dev/null || true
+        rm -f "${MERGED}.user_ids"
+        
+        N_PRI=$(grep -c "primary" "${MERGED}" || true)
+        N_SEC=$(grep -c "secondary" "${MERGED}" || true)
+        echo "   Primary: ${N_PRI} | Secondary: ${N_SEC} | Total: $((N_PRI + N_SEC))"
+        
+        EFFECTIVE_HIGHLIGHT="${MERGED}"
+
+    elif [ "${HAS_USER_HIGHLIGHT}" == "TRUE" ]; then
+        # 仅用户列表: 全部标记为 primary (添加第三列)
+        TAGGED="${OUT_DIR}/Pipeline7c/tagged_highlight.txt"
+        echo -e "Symbol\tGene\tSource" > "${TAGGED}"
+        awk -F'\t' 'NR>1{print $1"\t"$2"\tprimary"}' "${GRN_HIGHLIGHT}" >> "${TAGGED}"
+        EFFECTIVE_HIGHLIGHT="${TAGGED}"
+
+    elif [ "${HAS_AUTO_HIGHLIGHT}" == "TRUE" ]; then
+        # 仅 auto: 全部标记为 primary (无用户列表时 cluster 基因享有完整锚点地位)
+        TAGGED="${OUT_DIR}/Pipeline7c/tagged_highlight.txt"
+        echo -e "Symbol\tGene\tSource" > "${TAGGED}"
+        awk -F'\t' '{print $1"\t"$2"\tprimary"}' "${AUTO_HL_OUTPUT}" >> "${TAGGED}"
+        EFFECTIVE_HIGHLIGHT="${TAGGED}"
+
+    else
+        echo " ⚠ No highlight genes from any source."
+    fi
+
+    # === v4.5: Ego-steps 智能分配 ===
+    if [ -n "${CLI_EGO_STEPS}" ]; then
+        NETWORK_EGO_STEPS="${CLI_EGO_STEPS}"
+    elif [ "${HAS_USER_HIGHLIGHT}" == "TRUE" ]; then
+        # 有用户列表 (无论是否合并了 cluster): ego=0, 不做距离截断
+        NETWORK_EGO_STEPS="0"
+    else
+        # 纯 auto 模式: 使用 config 值
+        NETWORK_EGO_STEPS="${GRN_NETWORK_EGO_STEPS:-2}"
+    fi
+    echo " ★ Ego-steps: ${NETWORK_EGO_STEPS}"
 
     echo ""
     echo " Input:    ${RDATA_7B}"
@@ -631,11 +735,17 @@ if [ "${RUN_7C}" == "TRUE" ]; then
         "--network_node_size_min"   "${NETWORK_NODE_SIZE_MIN}"
         "--network_node_size_max"   "${NETWORK_NODE_SIZE_MAX}"
         "--network_ego_steps"       "${NETWORK_EGO_STEPS}"
+        "--network_max_secondary_steps" "${NETWORK_MAX_SECONDARY_STEPS}"
+        "--network_intra_completion" "${NETWORK_INTRA_COMPLETION}"
+        "--network_shared_targets" "${NETWORK_SHARED_TARGETS}"
         "--circos_max_edges"        "${CIRCOS_MAX_EDGES}"
         "--circos_top_edges"        "${CIRCOS_TOP_EDGES}"
         "--deseq2_rdata"            "${DESEQ2_RDATA}"
         "--control_time"            "${CTRL_TIME}"
     )
+
+    # ★ v4.6: 传递基因ID清理正则给 7c (统一与 7d 相同的正则化逻辑)
+    [ -n "${GENE_ID_STRIP_PATTERN}" ] && ARGS_7C+=("--gene_id_strip" "${GENE_ID_STRIP_PATTERN}")
 
     [ -n "${CLUSTER_COLORS_FILE}" ] && [ -f "${CLUSTER_COLORS_FILE}" ] && ARGS_7C+=("--cluster_colors" "${CLUSTER_COLORS_FILE}")
     [ -n "${EDGE_CLASS_COLORS_FILE}" ] && [ -f "${EDGE_CLASS_COLORS_FILE}" ] && ARGS_7C+=("--edge_class_colors" "${EDGE_CLASS_COLORS_FILE}")
