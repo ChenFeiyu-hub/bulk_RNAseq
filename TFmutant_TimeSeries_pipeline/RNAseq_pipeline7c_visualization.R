@@ -2321,7 +2321,7 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
     # Step 7f: 配色方案
     # ===================================================================
 
-    brg_pal <- rev(brewer.pal(11, "BrBG"))
+    brg_pal <- rev(brewer.pal(11, "RdBu"))
     body_col_fun <- colorRamp2(seq(-5, 5, length.out = 11), brg_pal)
 
     # ===================================================================
@@ -2715,7 +2715,7 @@ if ("evidence_heatmap" %in% PARAMS$plots_vec) {
       target_box_count  = sum(target_mats$boxes),
       tf_star_count     = sum(tf_mats$stars != ""),
       tf_box_count      = sum(tf_mats$boxes),
-      color_palette     = "reversed BrBG",
+      color_palette     = "reversed RdBu",
       fig7a_size        = c(fig_w_t, fig_h_t),
       fig7b_size        = c(fig_w_tf, fig_h_tf),
       target_clusters   = as.list(table(target_meta$WT_Cluster_label)),
