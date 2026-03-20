@@ -354,7 +354,7 @@ GRN_NETWORK_EGO_STEPS="2"              # 仅保留 focus_gene N 步内的节点
 
 # --- Fig5 Circos 参数 ---
 GRN_CIRCOS_MAX_EDGES="500"
-GRN_CIRCOS_TOP_EDGES="300"
+GRN_CIRCOS_TOP_EDGES="500"
 
 # ========== 7d 自动生成 highlight 列表参数 (v4.6) ==========
 GRN_AUTO_HIGHLIGHT_CLUSTERS="WT_C3"
